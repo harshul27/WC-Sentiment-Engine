@@ -1,0 +1,25 @@
+{
+  "version": "0.1.0",
+  "hyperparameters": {
+    "panic_score_bounds": [
+      -1.0,
+      1.0
+    ],
+    "xg_rolling_window_minutes": 10,
+    "arbitrage_flag_threshold": 0.35
+  },
+  "log_loss_history": [
+    {
+      "timestamp": "2026-06-10T19:15:02+00:00",
+      "log_loss": 0.548905,
+      "threshold": 0.35,
+      "evaluated_minutes": 91
+    },
+    {
+      "timestamp": "2026-06-10T21:06:45+00:00",
+      "log_loss": 0.548905,
+      "threshold": 0.35,
+      "evaluated_minutes": 91
+    }
+  ]
+}

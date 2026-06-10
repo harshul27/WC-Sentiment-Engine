@@ -1,0 +1,7 @@
+duckdb==1.5.3
+pandas==2.3.0
+numpy==2.2.6
+streamlit==1.54.0
+beautifulsoup4==4.13.4
+requests==2.34.2
+pyarrow==23.0.1

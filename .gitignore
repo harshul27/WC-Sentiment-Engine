@@ -1,0 +1,9 @@
+# Local testing instance — never committed (see CLAUDE.md File Registry)
+data/database.duckdb
+
+# Python artifacts
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/

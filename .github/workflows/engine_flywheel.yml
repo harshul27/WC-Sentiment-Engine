@@ -1,0 +1,56 @@
+name: Engine Flywheel
+
+on:
+  schedule:
+    - cron: "*/20 * * * *" # tournament live refresh (no-op commit when state unchanged)
+    - cron: "0 0 * * *" # nightly self-correction
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-flywheel
+  cancel-in-progress: false
+
+jobs:
+  flywheel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install pinned dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Gate on test suite (nightly & manual runs)
+        if: github.event.schedule == '0 0 * * *' || github.event_name == 'workflow_dispatch'
+        run: python -m pytest tests -q
+
+      - name: Run live-first ingestion & arbitrage scoring
+        run: python src/pipeline.py run
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          COMMENTARY_FEED_URL: ${{ vars.COMMENTARY_FEED_URL }}
+
+      - name: Nightly self-correction (threshold grid search)
+        if: github.event.schedule == '0 0 * * *' || github.event_name == 'workflow_dispatch'
+        run: python src/pipeline.py optimize
+
+      - name: Commit refreshed state
+        run: |
+          git config user.name "engine-flywheel[bot]"
+          git config user.email "engine-flywheel[bot]@users.noreply.github.com"
+          git add data/state.parquet data/model_config.json
+          git diff --cached --quiet || git commit -m "chore: refresh operational state [skip ci]"
+          git push
