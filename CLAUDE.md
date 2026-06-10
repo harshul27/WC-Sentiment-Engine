@@ -99,4 +99,6 @@ WC-sentiment-Engine/
 
 **Real-time latency profile:** portal open during a match ≈ 60s end-to-end; committed state for closed browsers ≈ 20 min via Actions; sentiment source is Bluesky (free X/YouTube firehoses do not exist).
 
-**Next Session Focus:** Push to GitHub, deploy `src/app.py` on Streamlit Community Cloud, set `STATE_PARQUET_URL` to the repo Raw URL. After first push: enable branch protection on `main` requiring the CI checks, and enable Dependabot security updates. Tournament starts 2026-06-11 19:00 UTC (MEX–RSA) — first live validation window.
+**Deployed (2026-06-10):** Repository live at https://github.com/harshul27/WC-Sentiment-Engine. First production validation complete: CI green on GitHub runners, manual flywheel run passed the test gate, ingested, self-corrected, and autonomously committed `data/state.parquet` + `model_config.json` back to main (`0daaa4e`). Dependabot immediately opened 3 update PRs, each gated by CI — the security loop is functioning.
+
+**Next Session Focus:** Deploy `src/app.py` on Streamlit Community Cloud (point it at the repo, main branch); set `STATE_PARQUET_URL=https://raw.githubusercontent.com/harshul27/WC-Sentiment-Engine/main/data/state.parquet`. Enable branch protection on `main` requiring the CI checks. Tournament starts 2026-06-11 19:00 UTC (MEX–RSA) — first live validation window.
