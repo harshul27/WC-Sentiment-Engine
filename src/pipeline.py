@@ -26,6 +26,7 @@ from bs4 import BeautifulSoup
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
+import archive
 import live
 from emotion import EMOTION_COLUMNS, EmotionAgent
 from model import (
@@ -172,22 +173,26 @@ def persist_to_duckdb(
         connection.close()
 
 
-def gather_streams() -> tuple[pd.DataFrame, pd.Series, str]:
-    """Source selection, live-first: ESPN/Bluesky -> feed URL -> simulator."""
+def gather_streams() -> tuple[pd.DataFrame, pd.Series, str, pd.Series | None]:
+    """Source selection: live or post-window ESPN match -> feed URL -> simulator.
+
+    Returns (chat, commentary, match_id, match_row); match_row is the
+    scoreboard row when a real fixture was captured, else None.
+    """
     seed = int(date.today().strftime("%Y%m%d"))
-    match = live.current_live_match()
+    match = live.current_capture_match()
     if match is not None:
         chat, commentary = live.live_streams(match)
         if not commentary.empty:
-            return chat, commentary, f"ESPN-{match['event_id']}"
+            return chat, commentary, f"ESPN-{match['event_id']}", match
     feed_url = os.environ.get("COMMENTARY_FEED_URL", "")
     if feed_url:
         scraped = fetch_live_commentary(feed_url)
         if not scraped.empty:
             chat, _ = simulate_streams(seed)
-            return chat, scraped, f"FEED-{seed}"
+            return chat, scraped, f"FEED-{seed}", None
     chat, commentary = simulate_streams(seed)
-    return chat, commentary, f"SIM-{seed}"
+    return chat, commentary, f"SIM-{seed}", None
 
 
 def fill_emotion_columns(state: pd.DataFrame) -> pd.DataFrame:
@@ -208,7 +213,7 @@ def run_ingest() -> pd.DataFrame:
     """Full ingestion pass: streams -> agents -> DuckDB -> state.parquet."""
     config = load_config(str(CONFIG_PATH))
     params = config["hyperparameters"]
-    chat, commentary, match_id = gather_streams()
+    chat, commentary, match_id, match_row = gather_streams()
     social_agent = EmotionAgent(window_minutes=5)
     match_agent = MatchProgressionAgent(
         window_minutes=int(params["xg_rolling_window_minutes"])
@@ -221,7 +226,26 @@ def run_ingest() -> pd.DataFrame:
     events = parse_commentary(commentary)
     persist_to_duckdb(chat, commentary, events, state, DB_PATH, STATE_PATH)
     flagged = int(state["flagged"].sum())
-    print(f"[run] match_id={match_id} rows={len(state)} flagged_minutes={flagged}")
+    archived = 0
+    if match_row is not None and not state.empty:
+        archived = archive.archive_match(
+            state,
+            {
+                "match_id": match_id,
+                "home_team": match_row.get("home_team"),
+                "away_team": match_row.get("away_team"),
+                "kickoff_utc": match_row.get("kickoff_utc"),
+                "final_score": match_row.get("score"),
+                "state": match_row.get("state"),
+            },
+            db_path=DB_PATH,
+            archive_path=DB_PATH.parent / "match_archive.parquet",
+            results_path=DB_PATH.parent / "match_results.parquet",
+        )
+    print(
+        f"[run] match_id={match_id} rows={len(state)} "
+        f"flagged_minutes={flagged} archived_rows={archived}"
+    )
     return state
 
 

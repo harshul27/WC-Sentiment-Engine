@@ -49,7 +49,8 @@ WC-sentiment-Engine/
 │   ├── emotion.py             # Custom 6-emotion classifier, mood volatility, takeaway generator
 │   ├── sources.py             # Multi-source reaction aggregator (Bluesky/Mastodon keyless; Reddit/YouTube key-gated), 200-comment window
 │   ├── matchstats.py          # ESPN boxscore control index + optional ScraperFC/Sofascore momentum
-│   ├── live.py                # ESPN scoreboard/commentary connectors + minute mapping
+│   ├── live.py                # ESPN connectors, minute mapping, capture_phase start/stop lifecycle
+│   ├── archive.py             # NOT NULL match archive: match_archive + match_results (DuckDB + Parquet mirror)
 │   ├── pipeline.py            # Live-first DuckDB ingestion, parsing, and Parquet pipeline
 │   └── app.py                 # Streamlit frontend: live mode (60s auto-refresh), simulator, committed state
 ├── tests/
@@ -111,4 +112,10 @@ WC-sentiment-Engine/
 19. Dashboard v2 — emotion area chart, crowd-mood badges, "What This Means Right Now" takeaway panel, source-labelled reaction window. State schema extended with emo_* shares, dominant_emotion, emotional_volatility, comment_volume.
 20. Suite now 64 tests, all offline. First REAL live ingestion achieved during the MEX–RSA opener: `match_id=ESPN-760415`, 115 minutes scored, 2 arbitrage flags.
 
-**Next Session Focus:** Redeploy/reboot Streamlit Cloud app to pick up the emotion dashboard. Optional keys to add as secrets for deeper coverage: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET` (free script app at reddit.com/prefs/apps), `YOUTUBE_API_KEY` (free Data API). Evaluate emotion-lexicon expansion from real tournament chatter; consider Sofascore retry locally with `ENABLE_SOFASCORE=1`.
+**Completed (2026-06-11, capture lifecycle & match archive pass):**
+21. `live.capture_phase` start/stop filter — pre → live → post-window (15-minute grace after FT to capture the emotional settle, `POST_GRACE`) → frozen (all fetching stops; 180-min `MATCH_MAX_DURATION` guard freezes long-finished fixtures immediately). `current_capture_match` extends pipeline source selection to finished matches still inside their window.
+22. Dashboard lifecycle — live panel shows a countdown banner during the post-window, snapshots the final state into session, and when frozen serves the snapshot or the committed archive with zero network fetches.
+23. `src/archive.py` — strict schema: `match_archive` (PK match_id+minute, every column NOT NULL with CHECK range constraints on scores/shares/indexes) + `match_results` (fixture metadata, final score = ground truth for the self-correction loop). Idempotent delete+insert upserts; DuckDB tables mirrored to committed `data/match_archive.parquet` / `match_results.parquet` so the corpus survives ephemeral runners. Flywheel commit step now `git add -A data/`.
+24. First real archive captured: ESPN-760415 Mexico 2-0 South Africa, 131 validated minute-rows, zero nulls. Suite: 74 tests.
+
+**Next Session Focus:** Wire `run_optimize` to train on the growing `match_archive` + `match_results` corpus (real outcomes) instead of simulated ground truth once a few matches accumulate. Reboot Streamlit Cloud app. Optional secrets for deeper coverage: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`.

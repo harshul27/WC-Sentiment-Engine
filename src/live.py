@@ -188,6 +188,38 @@ def posts_to_chat(
     return recent[columns].reset_index(drop=True)
 
 
+POST_GRACE = timedelta(minutes=15)
+MATCH_MAX_DURATION = timedelta(minutes=180)
+
+
+def capture_phase(
+    state: str,
+    kickoff_utc: datetime,
+    now: datetime | None = None,
+    post_first_seen: datetime | None = None,
+) -> str:
+    """Start/stop filter for data collection around one fixture.
+
+    Returns one of:
+      pre         - before kickoff, nothing to collect yet
+      live        - match in progress, full collection
+      post-window - finished within the 15-minute grace window: keep
+                    collecting to capture the post-match emotional settle
+      frozen      - grace window elapsed (or match long over): stop all
+                    fetching and serve archived data only
+    """
+    current = utc_now() if now is None else now
+    if state == "pre":
+        return "pre"
+    if state == "in":
+        return "live"
+    if post_first_seen is not None and current - post_first_seen >= POST_GRACE:
+        return "frozen"
+    if kickoff_utc is not None and current >= kickoff_utc + MATCH_MAX_DURATION:
+        return "frozen"
+    return "post-window"
+
+
 def current_live_match(scoreboard: pd.DataFrame | None = None) -> pd.Series | None:
     """The first in-progress fixture today, or None outside match windows."""
     board = fetch_scoreboard() if scoreboard is None else scoreboard
@@ -197,6 +229,30 @@ def current_live_match(scoreboard: pd.DataFrame | None = None) -> pd.Series | No
     if live.empty:
         return None
     return live.iloc[0]
+
+
+def current_capture_match(
+    scoreboard: pd.DataFrame | None = None, now: datetime | None = None
+) -> pd.Series | None:
+    """The fixture the pipeline should collect right now, if any.
+
+    Prefers an in-progress match; otherwise a finished match still inside
+    its capture window (so the scheduled runs archive full-time data),
+    otherwise None.
+    """
+    board = fetch_scoreboard() if scoreboard is None else scoreboard
+    if board.empty:
+        return None
+    live = board.loc[board["state"] == "in"]
+    if not live.empty:
+        return live.iloc[0]
+    current = utc_now() if now is None else now
+    finished = board.loc[board["state"] == "post"]
+    for _, row in finished.iterrows():
+        kickoff = row["kickoff_utc"]
+        if kickoff is not None and current < kickoff + MATCH_MAX_DURATION:
+            return row
+    return None
 
 
 def live_streams(match: pd.Series) -> tuple[pd.DataFrame, pd.Series]:

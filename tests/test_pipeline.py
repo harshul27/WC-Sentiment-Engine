@@ -91,11 +91,14 @@ def test_gather_streams_prefers_live_match(monkeypatch: pytest.MonkeyPatch) -> N
     )
     live_chat = pd.DataFrame({"minute": [1], "message": ["we are choking"]})
     live_commentary = pd.Series(["1' shot on target"], dtype="str", name="line")
-    monkeypatch.setattr(pipeline.live, "current_live_match", lambda scoreboard=None: match)
+    monkeypatch.setattr(
+        pipeline.live, "current_capture_match", lambda scoreboard=None, now=None: match
+    )
     monkeypatch.setattr(pipeline.live, "live_streams", lambda m: (live_chat, live_commentary))
-    chat, commentary, match_id = pipeline.gather_streams()
+    chat, commentary, match_id, match_row = pipeline.gather_streams()
     assert match_id == "ESPN-760415"
     assert commentary.tolist() == ["1' shot on target"]
+    assert match_row is not None
 
 
 def test_gather_streams_falls_back_when_live_commentary_empty(
@@ -103,13 +106,16 @@ def test_gather_streams_falls_back_when_live_commentary_empty(
 ) -> None:
     match = pd.Series({"event_id": "1", "home_team": "A", "away_team": "B"})
     empty = pd.Series(dtype="str", name="line")
-    monkeypatch.setattr(pipeline.live, "current_live_match", lambda scoreboard=None: match)
+    monkeypatch.setattr(
+        pipeline.live, "current_capture_match", lambda scoreboard=None, now=None: match
+    )
     monkeypatch.setattr(
         pipeline.live, "live_streams", lambda m: (pd.DataFrame(), empty)
     )
-    _, commentary, match_id = pipeline.gather_streams()
+    _, commentary, match_id, match_row = pipeline.gather_streams()
     assert match_id.startswith("SIM-")
     assert not commentary.empty
+    assert match_row is None
 
 
 def test_run_ingest_and_optimize_end_to_end(
@@ -120,7 +126,7 @@ def test_run_ingest_and_optimize_end_to_end(
     monkeypatch.setattr(pipeline, "STATE_PATH", tmp_path / "state.parquet")
     monkeypatch.setattr(pipeline, "CONFIG_PATH", config_path)
     monkeypatch.setattr(
-        pipeline.live, "current_live_match", lambda scoreboard=None: None
+        pipeline.live, "current_capture_match", lambda scoreboard=None, now=None: None
     )
 
     state = pipeline.run_ingest()

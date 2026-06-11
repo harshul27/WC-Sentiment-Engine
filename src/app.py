@@ -20,8 +20,9 @@ import streamlit as st
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
+from archive import load_archive
 from emotion import EMOTION_COLUMNS, EmotionAgent, generate_takeaways
-from live import fetch_scoreboard, live_streams, utc_now
+from live import POST_GRACE, capture_phase, fetch_scoreboard, live_streams, utc_now
 from matchstats import control_index, fetch_boxscore
 from model import ArbitrageSelector, MatchProgressionAgent, load_config
 from pipeline import fill_emotion_columns, simulate_streams
@@ -182,9 +183,29 @@ def render_reactions(chat: pd.DataFrame) -> None:
         st.dataframe(chat.tail(30), use_container_width=True, hide_index=True)
 
 
+def render_full_panel(
+    state: pd.DataFrame, chat: pd.DataFrame, match_stats: dict
+) -> None:
+    control = control_index(match_stats)
+    render_metrics(state, st.container())
+    render_chart(state, st.empty())
+    render_takeaways(state, match_stats)
+    if control is not None and match_stats:
+        first_team = next(iter(match_stats))
+        st.caption(f"Match control index: {first_team} {control:.0%} of the contest.")
+    render_emotions(state, st.container())
+    render_flags(state)
+    render_reactions(chat)
+
+
 @st.fragment(run_every=60)
 def live_panel(event_id: str) -> None:
-    """Auto-refreshing live view: refetches all streams every 60 seconds."""
+    """Auto-refreshing live view with a post-match start/stop filter.
+
+    Collection phases: pre (idle) -> live (full fetch) -> post-window
+    (15 more minutes of fetching after full time to capture the emotional
+    settle) -> frozen (all fetching stops; archived data only).
+    """
     board = load_scoreboard()
     rows = board.loc[board["event_id"] == event_id]
     if rows.empty:
@@ -196,9 +217,44 @@ def live_panel(event_id: str) -> None:
     head[1].metric("Score", str(match["score"]))
     head[2].metric("Clock", f"{int(match['clock_minute'])}'")
     head[3].metric("Status", str(match["state"]).upper())
-    if match["state"] == "pre":
+
+    post_seen = st.session_state.setdefault("post_first_seen", {})
+    if match["state"] == "post" and event_id not in post_seen:
+        post_seen[event_id] = utc_now()
+    phase = capture_phase(
+        str(match["state"]), match["kickoff_utc"], post_first_seen=post_seen.get(event_id)
+    )
+
+    if phase == "pre":
         st.info(f"Kickoff at {match['kickoff_utc']:%H:%M UTC}. Panel refreshes automatically.")
         return
+
+    if phase == "frozen":
+        snapshot = st.session_state.get(f"final_snapshot_{event_id}")
+        if snapshot is not None:
+            st.info(
+                "🏁 Match ended — data collection stopped 15 minutes after "
+                "full time. Showing the final captured state."
+            )
+            render_full_panel(*snapshot)
+            return
+        archived = load_archive(f"ESPN-{event_id}")
+        if not archived.empty:
+            st.info(
+                "🏁 Match ended — collection window closed. Showing the "
+                "archived match record."
+            )
+            render_metrics(archived, st.container())
+            render_chart(archived, st.empty())
+            render_emotions(archived, st.container())
+            render_flags(archived)
+            return
+        st.info(
+            "🏁 Match ended and its collection window has closed. No archive "
+            "is available for this fixture yet."
+        )
+        return
+
     chat, commentary = live_streams(match)
     if commentary.empty:
         st.info("Waiting for the first commentary entries from the feed...")
@@ -208,16 +264,15 @@ def live_panel(event_id: str) -> None:
         st.info("Streams connected; not enough data to score yet.")
         return
     match_stats = fetch_boxscore(event_id)
-    control = control_index(match_stats)
-    render_metrics(state, st.container())
-    render_chart(state, st.empty())
-    render_takeaways(state, match_stats)
-    if control is not None and match_stats:
-        first_team = next(iter(match_stats))
-        st.caption(f"Match control index: {first_team} {control:.0%} of the contest.")
-    render_emotions(state, st.container())
-    render_flags(state)
-    render_reactions(chat)
+    if phase == "post-window":
+        first_seen = post_seen.get(event_id, utc_now())
+        remaining = max(0, int((POST_GRACE - (utc_now() - first_seen)).total_seconds() // 60))
+        st.warning(
+            f"⏱️ Full time — post-match capture window open, collection "
+            f"stops in ~{remaining} min."
+        )
+        st.session_state[f"final_snapshot_{event_id}"] = (state, chat, match_stats)
+    render_full_panel(state, chat, match_stats)
     st.caption(f"Live mode - last refresh {utc_now():%H:%M:%S UTC}, next in ~60s.")
 
 

@@ -159,6 +159,51 @@ def test_current_live_match_none_when_nothing_in_progress() -> None:
     assert live.current_live_match(live.parse_scoreboard({})) is None
 
 
+def test_capture_phase_lifecycle() -> None:
+    kickoff = datetime(2026, 6, 11, 19, 0, tzinfo=timezone.utc)
+    during = kickoff + timedelta(minutes=60)
+    just_finished = kickoff + timedelta(minutes=120)
+    assert live.capture_phase("pre", kickoff, now=kickoff) == "pre"
+    assert live.capture_phase("in", kickoff, now=during) == "live"
+    assert (
+        live.capture_phase("post", kickoff, now=just_finished, post_first_seen=just_finished)
+        == "post-window"
+    )
+    assert (
+        live.capture_phase(
+            "post",
+            kickoff,
+            now=just_finished + timedelta(minutes=16),
+            post_first_seen=just_finished,
+        )
+        == "frozen"
+    )
+
+
+def test_capture_phase_freezes_long_finished_matches() -> None:
+    kickoff = datetime(2026, 6, 11, 19, 0, tzinfo=timezone.utc)
+    hours_later = kickoff + timedelta(hours=5)
+    assert live.capture_phase("post", kickoff, now=hours_later) == "frozen"
+
+
+def test_current_capture_match_prefers_live_then_recent_post() -> None:
+    board = live.parse_scoreboard(SCOREBOARD_FIXTURE)
+    picked = live.current_capture_match(board)
+    assert picked is not None
+    assert picked["state"] == "in"
+    finished = board.iloc[[0]].copy()
+    finished["state"] = "post"
+    kickoff = finished.iloc[0]["kickoff_utc"]
+    inside_window = live.current_capture_match(
+        finished, now=kickoff + timedelta(minutes=150)
+    )
+    assert inside_window is not None
+    outside_window = live.current_capture_match(
+        finished, now=kickoff + timedelta(minutes=200)
+    )
+    assert outside_window is None
+
+
 def test_fetchers_return_empty_on_network_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(*args: object, **kwargs: object) -> None:
         raise requests.ConnectionError("offline")
