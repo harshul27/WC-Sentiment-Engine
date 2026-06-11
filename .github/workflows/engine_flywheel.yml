@@ -47,10 +47,15 @@ jobs:
         if: github.event.schedule == '0 0 * * *' || github.event_name == 'workflow_dispatch'
         run: python src/pipeline.py optimize
 
+      # soccerdata needs rich>=14 while streamlit pins rich<14, so it is
+      # installed ad hoc here (last step, ephemeral runner) instead of in
+      # requirements.txt where it would make resolution impossible.
       - name: Refresh FBref team priors via soccerdata (best effort)
         if: github.event.schedule == '0 0 * * *' || github.event_name == 'workflow_dispatch'
         continue-on-error: true
-        run: python src/advanced.py refresh
+        run: |
+          pip install soccerdata==1.9.0
+          python src/advanced.py refresh
 
       - name: Commit refreshed state
         run: |
