@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS match_archive (
     delta_xg_10min       DOUBLE    NOT NULL CHECK (delta_xg_10min BETWEEN 0.0 AND 1.0),
     arbitrage_index      DOUBLE    NOT NULL CHECK (arbitrage_index BETWEEN 0.0 AND 1.0),
     flagged              BOOLEAN   NOT NULL,
+    situation            VARCHAR   NOT NULL,
+    situation_confidence DOUBLE    NOT NULL CHECK (situation_confidence BETWEEN 0.0 AND 1.0),
     archived_at          TIMESTAMP NOT NULL,
     PRIMARY KEY (match_id, minute)
 )
@@ -78,6 +80,8 @@ ARCHIVE_COLUMNS = [
     "delta_xg_10min",
     "arbitrage_index",
     "flagged",
+    "situation",
+    "situation_confidence",
     "archived_at",
 ]
 
@@ -128,6 +132,15 @@ def validate_state(state: pd.DataFrame, match_id: str) -> pd.DataFrame:
         .fillna("neutral")
         .astype(str)
     )
+    frame["situation"] = (
+        frame.get("situation", pd.Series(index=frame.index, dtype="object"))
+        .ffill()
+        .fillna("unknown")
+        .astype(str)
+    )
+    frame["situation_confidence"] = (
+        numeric("situation_confidence").ffill().fillna(0.0).clip(0.0, 1.0).astype("float64")
+    )
     flagged = frame.get("flagged")
     frame["flagged"] = (
         flagged.fillna(False).astype(bool) if flagged is not None else False
@@ -171,17 +184,37 @@ def archive_match(
             }
         ]
     )
+    # Seed from the committed Parquet mirrors first: runners are ephemeral,
+    # so the DuckDB file starts empty and the Parquet is the durable store.
+    prior_rows = load_archive(archive_path=archive_path)
+    if not prior_rows.empty:
+        prior_rows = prior_rows.loc[prior_rows["match_id"] != match_id]
+        for column in ARCHIVE_COLUMNS:
+            if column not in prior_rows.columns:
+                prior_rows[column] = (
+                    "unknown" if column == "situation" else 0.0
+                )
+        prior_rows = prior_rows[ARCHIVE_COLUMNS]
+    all_rows = (
+        pd.concat([prior_rows, rows], ignore_index=True) if not prior_rows.empty else rows
+    )
+    prior_results = load_results(results_path=results_path)
+    if not prior_results.empty:
+        prior_results = prior_results.loc[prior_results["match_id"] != match_id]
+    all_results = (
+        pd.concat([prior_results, result_row], ignore_index=True)
+        if not prior_results.empty
+        else result_row
+    )
     connection = duckdb.connect(str(db_path))
     try:
+        connection.execute("DROP TABLE IF EXISTS match_archive")
+        connection.execute("DROP TABLE IF EXISTS match_results")
         connection.execute(ARCHIVE_DDL)
         connection.execute(RESULTS_DDL)
-        connection.register("archive_rows", rows)
-        connection.register("result_row", result_row)
-        connection.execute("DELETE FROM match_archive WHERE match_id = ?", [match_id])
-        connection.execute(
-            "INSERT INTO match_archive SELECT * FROM archive_rows"
-        )
-        connection.execute("DELETE FROM match_results WHERE match_id = ?", [match_id])
+        connection.register("archive_rows", all_rows)
+        connection.register("result_row", all_results)
+        connection.execute("INSERT INTO match_archive SELECT * FROM archive_rows")
         connection.execute("INSERT INTO match_results SELECT * FROM result_row")
         connection.execute(
             "COPY (SELECT * FROM match_archive ORDER BY match_id, minute) TO ? "

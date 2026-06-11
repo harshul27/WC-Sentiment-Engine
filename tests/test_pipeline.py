@@ -136,6 +136,9 @@ def test_run_ingest_and_optimize_end_to_end(
     assert "dominant_emotion" in state.columns
     assert "emo_panic" in state.columns
     assert not state["emo_panic"].isna().any()
+    assert "situation" in state.columns
+    assert state["situation"].isin(list(__import__("situation").PROTOTYPES)).all()
+    assert state["situation_confidence"].between(0, 1).all()
 
     result = pipeline.run_optimize()
     assert 0.05 <= result["arbitrage_flag_threshold"] <= 0.95

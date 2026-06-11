@@ -20,12 +20,14 @@ import streamlit as st
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
+from advanced import fixture_prior
 from archive import load_archive
 from emotion import EMOTION_COLUMNS, EmotionAgent, generate_takeaways
 from live import POST_GRACE, capture_phase, fetch_scoreboard, live_streams, utc_now
 from matchstats import control_index, fetch_boxscore
 from model import ArbitrageSelector, MatchProgressionAgent, load_config
 from pipeline import fill_emotion_columns, simulate_streams
+from situation import classify, metrics_that_matter, situation_brief
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / "data" / "state.parquet"
@@ -77,7 +79,7 @@ def run_selector(chat: pd.DataFrame, commentary: pd.Series) -> pd.DataFrame:
         window_minutes=int(params["xg_rolling_window_minutes"])
     ).run(commentary)
     selector = ArbitrageSelector(threshold=float(params["arbitrage_flag_threshold"]))
-    return fill_emotion_columns(selector.run(social, match))
+    return classify(fill_emotion_columns(selector.run(social, match)))
 
 
 def active_threshold() -> float:
@@ -140,6 +142,23 @@ def render_emotions(frame: pd.DataFrame, container) -> None:
         )
 
 
+def render_situation(frame: pd.DataFrame, priors_note: str = "") -> None:
+    """The classifier's verdict + the metrics that matter in this situation."""
+    if frame.empty or "situation" not in frame.columns:
+        return
+    latest = frame.iloc[-1]
+    brief = situation_brief(str(latest["situation"]))
+    st.subheader("🧭 Match Situation (live classification)")
+    cols = st.columns(2 + len(brief["metrics"]))
+    cols[0].metric("Situation", str(brief["label"]))
+    cols[1].metric("Confidence", f"{float(latest['situation_confidence']):.0%}")
+    for slot, (column, label, value) in zip(
+        cols[2:], metrics_that_matter(frame)
+    ):
+        slot.metric(label, f"{value:+.2f}" if column == "crowd_panic_score" else f"{value:.2f}")
+    st.caption(str(brief["read"]) + (f" {priors_note}" if priors_note else ""))
+
+
 def render_takeaways(frame: pd.DataFrame, match_stats: dict | None = None) -> None:
     st.subheader("💡 What This Means Right Now")
     for takeaway in generate_takeaways(frame, active_threshold(), match_stats):
@@ -184,11 +203,15 @@ def render_reactions(chat: pd.DataFrame) -> None:
 
 
 def render_full_panel(
-    state: pd.DataFrame, chat: pd.DataFrame, match_stats: dict
+    state: pd.DataFrame,
+    chat: pd.DataFrame,
+    match_stats: dict,
+    priors_note: str = "",
 ) -> None:
     control = control_index(match_stats)
     render_metrics(state, st.container())
     render_chart(state, st.empty())
+    render_situation(state, priors_note)
     render_takeaways(state, match_stats)
     if control is not None and match_stats:
         first_team = next(iter(match_stats))
@@ -196,6 +219,25 @@ def render_full_panel(
     render_emotions(state, st.container())
     render_flags(state)
     render_reactions(chat)
+
+
+def priors_note_for(match: pd.Series) -> str:
+    """One-line FBref priors context for the fixture, when available."""
+    prior = fixture_prior(str(match.get("home_team", "")), str(match.get("away_team", "")))
+    if prior is None:
+        return ""
+    parts: list[str] = []
+    for side in ("home", "away"):
+        row = prior[side]
+        if row is not None:
+            parts.append(
+                f"{row['team']}: {row['goals_for_per_match']:.1f} gf / "
+                f"{row['goals_against_per_match']:.1f} ga per match"
+            )
+    note = "Tournament priors (FBref) - " + "; ".join(parts) + "."
+    if prior["edge"] is not None:
+        note += f" Scoring edge {prior['edge']:+.2f} to the home side."
+    return note
 
 
 @st.fragment(run_every=60)
@@ -272,7 +314,7 @@ def live_panel(event_id: str) -> None:
             f"stops in ~{remaining} min."
         )
         st.session_state[f"final_snapshot_{event_id}"] = (state, chat, match_stats)
-    render_full_panel(state, chat, match_stats)
+    render_full_panel(state, chat, match_stats, priors_note_for(match))
     st.caption(f"Live mode - last refresh {utc_now():%H:%M:%S UTC}, next in ~60s.")
 
 
@@ -310,6 +352,7 @@ def render_simulator_mode(seed: int, speed: float) -> None:
     state = st.session_state.get("sim_state", build_simulation(seed))
     render_metrics(state, metrics_slot.container())
     render_chart(state, chart_slot)
+    render_situation(state)
     render_takeaways(state)
     render_emotions(state, st.container())
     render_flags(state)
@@ -327,6 +370,7 @@ def render_state_mode() -> None:
         st.caption(f"Source run: {state['match_id'].iloc[-1]}")
     render_metrics(state, st.container())
     render_chart(state, st.empty())
+    render_situation(state)
     render_takeaways(state)
     render_emotions(state, st.container())
     render_flags(state)

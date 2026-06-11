@@ -51,6 +51,8 @@ WC-sentiment-Engine/
 │   ├── matchstats.py          # ESPN boxscore control index + optional ScraperFC/Sofascore momentum
 │   ├── live.py                # ESPN connectors, minute mapping, capture_phase start/stop lifecycle
 │   ├── archive.py             # NOT NULL match archive: match_archive + match_results (DuckDB + Parquet mirror)
+│   ├── situation.py           # Real-time nearest-centroid match-situation classifier + metrics playbook
+│   ├── advanced.py            # soccerdata/FBref team priors (nightly best-effort refresh -> team_priors.parquet)
 │   ├── pipeline.py            # Live-first DuckDB ingestion, parsing, and Parquet pipeline
 │   └── app.py                 # Streamlit frontend: live mode (60s auto-refresh), simulator, committed state
 ├── tests/
@@ -118,4 +120,10 @@ WC-sentiment-Engine/
 23. `src/archive.py` — strict schema: `match_archive` (PK match_id+minute, every column NOT NULL with CHECK range constraints on scores/shares/indexes) + `match_results` (fixture metadata, final score = ground truth for the self-correction loop). Idempotent delete+insert upserts; DuckDB tables mirrored to committed `data/match_archive.parquet` / `match_results.parquet` so the corpus survives ephemeral runners. Flywheel commit step now `git add -A data/`.
 24. First real archive captured: ESPN-760415 Mexico 2-0 South Africa, 131 validated minute-rows, zero nulls. Suite: 74 tests.
 
-**Next Session Focus:** Wire `run_optimize` to train on the growing `match_archive` + `match_results` corpus (real outcomes) instead of simulated ground truth once a few matches accumulate. Reboot Streamlit Cloud app. Optional secrets for deeper coverage: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`.
+**Completed (2026-06-12, situation classifier & soccerdata pass):**
+25. `src/situation.py` — interpretable nearest-centroid classifier running on every scored minute: 7 situations (cruise_control, balanced_contest, panic_divergence, genuine_crisis, late_drama, emotional_chaos, dead_rubber) from 5 weighted features (panic, xG stability, mood volatility, arbitrage index, match phase) with softmax confidence. Each situation carries a playbook: the metrics that matter right now (rendered dynamically in the dashboard) + a one-line product read. Validated on the archived opener (131 minutes classified sensibly).
+26. `src/advanced.py` — soccerdata 1.9.0 (FBref `INT-World Cup`) team priors: schedule-derived gf/ga per match, plus xG/possession once FBref publishes mid-tournament team stats. Committed to `data/team_priors.parquet` by a nightly best-effort flywheel step (`continue-on-error`; FBref is slow/cache-lagged and sometimes blocks datacenter IPs — never fetched from the app or 20-min ticks). Dashboard shows fixture priors context when available.
+27. Archive hardening: **fixed ephemeral-runner data-loss bug** (tables are now seeded from the committed Parquet mirrors before every upsert — previously a fresh runner's empty DuckDB would clobber the archive to a single match). Schema extended with `situation`/`situation_confidence` (NOT NULL + CHECK), with automatic migration of pre-classifier archives (defaults 'unknown'/0.0). Both covered by regression tests.
+28. State/archive rows now carry the classification; dashboard adds a "Match Situation" panel (situation badge, confidence, dynamic metrics-that-matter row, playbook read, priors note). Suite: 90 tests.
+
+**Next Session Focus:** Wire `run_optimize` to train on the growing `match_archive` + `match_results` corpus (real outcomes) instead of simulated ground truth once a few matches accumulate; consider learning situation prototypes from archived data the same way. Reboot Streamlit Cloud app. Optional secrets: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`.

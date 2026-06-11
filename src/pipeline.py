@@ -28,6 +28,7 @@ sys.path.append(str(Path(__file__).resolve().parent))
 
 import archive
 import live
+import situation
 from emotion import EMOTION_COLUMNS, EmotionAgent
 from model import (
     ArbitrageSelector,
@@ -219,8 +220,10 @@ def run_ingest() -> pd.DataFrame:
         window_minutes=int(params["xg_rolling_window_minutes"])
     )
     selector = ArbitrageSelector(threshold=float(params["arbitrage_flag_threshold"]))
-    state = fill_emotion_columns(
-        selector.run(social_agent.run(chat), match_agent.run(commentary))
+    state = situation.classify(
+        fill_emotion_columns(
+            selector.run(social_agent.run(chat), match_agent.run(commentary))
+        )
     )
     state.insert(0, "match_id", match_id)
     events = parse_commentary(commentary)

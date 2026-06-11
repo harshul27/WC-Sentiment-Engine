@@ -99,6 +99,43 @@ def test_archive_match_upsert_is_idempotent(tmp_path: Path) -> None:
     assert len(results) == 1
 
 
+def test_archive_survives_fresh_database(tmp_path: Path) -> None:
+    """Ephemeral runners start with an empty DuckDB: the Parquet mirror
+    must seed the tables so earlier matches are never clobbered."""
+    paths = {
+        "db_path": tmp_path / "db.duckdb",
+        "archive_path": tmp_path / "match_archive.parquet",
+        "results_path": tmp_path / "match_results.parquet",
+    }
+    archive.archive_match(_raw_state(), META, **paths)
+    paths["db_path"].unlink()
+    second_meta = {**META, "match_id": "ESPN-760414", "home_team": "South Korea"}
+    archive.archive_match(_raw_state(), second_meta, **paths)
+    rows = archive.load_archive(archive_path=paths["archive_path"])
+    assert set(rows["match_id"]) == {"ESPN-760415", "ESPN-760414"}
+    results = archive.load_results(results_path=paths["results_path"])
+    assert len(results) == 2
+
+
+def test_archive_migrates_old_schema_parquet(tmp_path: Path) -> None:
+    """Pre-classifier archives lack the situation columns; upserting a new
+    match must keep the old rows, defaulting them to 'unknown'."""
+    paths = {
+        "db_path": tmp_path / "db.duckdb",
+        "archive_path": tmp_path / "match_archive.parquet",
+        "results_path": tmp_path / "match_results.parquet",
+    }
+    old_rows = archive.validate_state(_raw_state(), "ESPN-OLD").drop(
+        columns=["situation", "situation_confidence"]
+    )
+    old_rows.to_parquet(paths["archive_path"])
+    archive.archive_match(_raw_state(), META, **paths)
+    rows = archive.load_archive(archive_path=paths["archive_path"])
+    assert set(rows["match_id"]) == {"ESPN-OLD", "ESPN-760415"}
+    migrated = rows.loc[rows["match_id"] == "ESPN-OLD"]
+    assert (migrated["situation"] == "unknown").all()
+
+
 def test_load_archive_missing_file() -> None:
     rows = archive.load_archive(archive_path=Path("does/not/exist.parquet"))
     assert rows.empty

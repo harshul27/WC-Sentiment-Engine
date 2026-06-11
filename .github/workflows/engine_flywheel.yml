@@ -47,6 +47,11 @@ jobs:
         if: github.event.schedule == '0 0 * * *' || github.event_name == 'workflow_dispatch'
         run: python src/pipeline.py optimize
 
+      - name: Refresh FBref team priors via soccerdata (best effort)
+        if: github.event.schedule == '0 0 * * *' || github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        run: python src/advanced.py refresh
+
       - name: Commit refreshed state
         run: |
           git config user.name "engine-flywheel[bot]"
