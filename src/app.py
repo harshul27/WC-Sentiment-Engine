@@ -1,8 +1,8 @@
 """Streamlit frontend: real-time arbitrage ticker for the WC Sentiment Engine.
 
 Three display modes:
-  Live match      - polls free ESPN + Bluesky public APIs every 60 seconds
-                    and recomputes the agents against the real ongoing match
+  Live match      - polls free ESPN + multi-source crowd APIs every 60
+                    seconds and recomputes the agents against the real match
   Simulator       - animated replay of a deterministic mock match
   Committed state - latest data/state.parquet produced by the GitHub Action
 
@@ -20,9 +20,11 @@ import streamlit as st
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
+from emotion import EMOTION_COLUMNS, EmotionAgent, generate_takeaways
 from live import fetch_scoreboard, live_streams, utc_now
-from model import ArbitrageSelector, MatchProgressionAgent, SocialListeningAgent, load_config
-from pipeline import simulate_streams
+from matchstats import control_index, fetch_boxscore
+from model import ArbitrageSelector, MatchProgressionAgent, load_config
+from pipeline import fill_emotion_columns, simulate_streams
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / "data" / "state.parquet"
@@ -31,6 +33,8 @@ CHART_COLUMNS = ["crowd_panic_score", "delta_xg_10min", "arbitrage_index"]
 MODE_LIVE = "🔴 Live match"
 MODE_SIM = "🎮 Simulator"
 MODE_STATE = "📦 Committed state"
+EMOTION_LABELS = {col: col.removeprefix("emo_").title() for col in EMOTION_COLUMNS}
+TONE_RENDERERS = {"warning": st.warning, "positive": st.success, "info": st.info}
 
 
 @st.cache_data(ttl=300)
@@ -59,27 +63,32 @@ def load_scoreboard() -> pd.DataFrame:
 
 @st.cache_data(show_spinner="Simulating live match streams...")
 def build_simulation(seed: int) -> pd.DataFrame:
-    """Run the full three-agent pipeline on a deterministic mock match."""
+    """Run the full agent pipeline on a deterministic mock match."""
     chat, commentary = simulate_streams(seed)
-    social = SocialListeningAgent(window_minutes=5, use_llm=False).run(chat)
-    return run_selector(social, commentary)
+    return run_selector(chat, commentary)
 
 
-def run_selector(social: pd.DataFrame, commentary: pd.Series) -> pd.DataFrame:
+def run_selector(chat: pd.DataFrame, commentary: pd.Series) -> pd.DataFrame:
     config = load_config(str(CONFIG_PATH))
     params = config["hyperparameters"]
+    social = EmotionAgent(window_minutes=5).run(chat)
     match = MatchProgressionAgent(
         window_minutes=int(params["xg_rolling_window_minutes"])
     ).run(commentary)
     selector = ArbitrageSelector(threshold=float(params["arbitrage_flag_threshold"]))
-    return selector.run(social, match)
+    return fill_emotion_columns(selector.run(social, match))
+
+
+def active_threshold() -> float:
+    config = load_config(str(CONFIG_PATH))
+    return float(config["hyperparameters"]["arbitrage_flag_threshold"])
 
 
 def render_metrics(frame: pd.DataFrame, container) -> None:
     """Native st.metric badges for the latest tick of the supplied frame."""
     latest = frame.iloc[-1]
     previous = frame.iloc[-2] if len(frame) > 1 else latest
-    cols = container.columns(4)
+    cols = container.columns(5)
     cols[0].metric(
         "Crowd Panic Score",
         f"{latest['crowd_panic_score']:+.2f}",
@@ -97,15 +106,44 @@ def render_metrics(frame: pd.DataFrame, container) -> None:
         delta=f"{latest['arbitrage_index'] - previous['arbitrage_index']:+.2f}",
         delta_color="inverse",
     )
-    cols[3].metric("Flagged Minutes", int(frame["flagged"].sum()))
+    if "dominant_emotion" in frame.columns:
+        cols[3].metric("Crowd Mood", str(latest.get("dominant_emotion", "neutral")).title())
+    cols[4].metric("Flagged Minutes", int(frame["flagged"].sum()))
 
 
 def render_chart(frame: pd.DataFrame, container) -> None:
     container.line_chart(
         frame.set_index("minute")[CHART_COLUMNS],
-        height=380,
+        height=340,
         use_container_width=True,
     )
+
+
+def render_emotions(frame: pd.DataFrame, container) -> None:
+    """Stacked emotion-share area chart plus mood stability badge."""
+    available = [c for c in EMOTION_COLUMNS if c in frame.columns]
+    if not available or frame[available].sum().sum() == 0:
+        container.caption("Emotion profile: no classified reactions yet.")
+        return
+    container.subheader("🎭 Crowd Emotion Profile")
+    chart_frame = frame.set_index("minute")[available].rename(columns=EMOTION_LABELS)
+    container.area_chart(chart_frame, height=260, use_container_width=True)
+    if "emotional_volatility" in frame.columns:
+        latest = frame.iloc[-1]
+        cols = container.columns(3)
+        cols[0].metric("Mood Volatility", f"{latest['emotional_volatility']:.2f}")
+        if "comment_volume" in frame.columns:
+            cols[1].metric("Reactions This Minute", int(latest["comment_volume"]))
+        cols[2].metric(
+            "Dominant Emotion", str(latest.get("dominant_emotion", "neutral")).title()
+        )
+
+
+def render_takeaways(frame: pd.DataFrame, match_stats: dict | None = None) -> None:
+    st.subheader("💡 What This Means Right Now")
+    for takeaway in generate_takeaways(frame, active_threshold(), match_stats):
+        renderer = TONE_RENDERERS.get(takeaway["tone"], st.info)
+        renderer(f"**{takeaway['headline']}** — {takeaway['detail']}")
 
 
 def render_flags(frame: pd.DataFrame) -> None:
@@ -129,9 +167,24 @@ def render_flags(frame: pd.DataFrame) -> None:
     )
 
 
+def render_reactions(chat: pd.DataFrame) -> None:
+    """The 200-comment multi-source window behind the emotion profile."""
+    with st.expander(f"💬 Crowd reactions analysed ({len(chat)})"):
+        if chat.empty:
+            st.caption("No fan reactions matched this fixture yet.")
+            return
+        if "source" in chat.columns:
+            counts = chat["source"].value_counts()
+            st.caption(
+                "Sources: "
+                + ", ".join(f"{src} {n}" for src, n in counts.items())
+            )
+        st.dataframe(chat.tail(30), use_container_width=True, hide_index=True)
+
+
 @st.fragment(run_every=60)
 def live_panel(event_id: str) -> None:
-    """Auto-refreshing live view: refetches both streams every 60 seconds."""
+    """Auto-refreshing live view: refetches all streams every 60 seconds."""
     board = load_scoreboard()
     rows = board.loc[board["event_id"] == event_id]
     if rows.empty:
@@ -150,19 +203,21 @@ def live_panel(event_id: str) -> None:
     if commentary.empty:
         st.info("Waiting for the first commentary entries from the feed...")
         return
-    social = SocialListeningAgent(window_minutes=5).run(chat)
-    state = run_selector(social, commentary)
+    state = run_selector(chat, commentary)
     if state.empty:
         st.info("Streams connected; not enough data to score yet.")
         return
+    match_stats = fetch_boxscore(event_id)
+    control = control_index(match_stats)
     render_metrics(state, st.container())
     render_chart(state, st.empty())
+    render_takeaways(state, match_stats)
+    if control is not None and match_stats:
+        first_team = next(iter(match_stats))
+        st.caption(f"Match control index: {first_team} {control:.0%} of the contest.")
+    render_emotions(state, st.container())
     render_flags(state)
-    with st.expander(f"Latest crowd posts analysed ({len(chat)})"):
-        if chat.empty:
-            st.caption("No fan posts matched this fixture yet.")
-        else:
-            st.dataframe(chat.tail(20), use_container_width=True, hide_index=True)
+    render_reactions(chat)
     st.caption(f"Live mode - last refresh {utc_now():%H:%M:%S UTC}, next in ~60s.")
 
 
@@ -170,7 +225,7 @@ def render_live_mode() -> None:
     board = load_scoreboard()
     if board.empty:
         st.warning(
-            "Scoreboard unreachable or no World Cup fixtures today. "
+            "Scoreboard unreachable or no fixtures today. "
             "Switch to Simulator mode to see the engine in action."
         )
         return
@@ -197,12 +252,11 @@ def render_simulator_mode(seed: int, speed: float) -> None:
             time.sleep(speed)
         progress.empty()
         st.session_state["sim_state"] = state
-    if "sim_state" in st.session_state:
-        state = st.session_state["sim_state"]
-    else:
-        state = build_simulation(seed)
+    state = st.session_state.get("sim_state", build_simulation(seed))
     render_metrics(state, metrics_slot.container())
     render_chart(state, chart_slot)
+    render_takeaways(state)
+    render_emotions(state, st.container())
     render_flags(state)
 
 
@@ -218,6 +272,8 @@ def render_state_mode() -> None:
         st.caption(f"Source run: {state['match_id'].iloc[-1]}")
     render_metrics(state, st.container())
     render_chart(state, st.empty())
+    render_takeaways(state)
+    render_emotions(state, st.container())
     render_flags(state)
 
 
@@ -227,7 +283,7 @@ def main() -> None:
     )
     st.title("⚽ WC Sentiment Arbitrage Engine")
     st.caption(
-        "Wisdom-of-crowds divergence tracker: crowd panic vs. real match "
+        "Wisdom-of-crowds divergence tracker: crowd emotions vs. real match "
         "stability, flagged when sentiment decouples from the pitch."
     )
 

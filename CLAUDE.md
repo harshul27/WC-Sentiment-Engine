@@ -46,7 +46,10 @@ WC-sentiment-Engine/
 │   └── codeql.yml             # Weekly + PR CodeQL static security analysis
 ├── src/
 │   ├── model.py               # Vectorized sentiment math, agents, & arbitrage calculations
-│   ├── live.py                # Free live connectors: ESPN scoreboard/commentary + Bluesky crowd posts
+│   ├── emotion.py             # Custom 6-emotion classifier, mood volatility, takeaway generator
+│   ├── sources.py             # Multi-source reaction aggregator (Bluesky/Mastodon keyless; Reddit/YouTube key-gated), 200-comment window
+│   ├── matchstats.py          # ESPN boxscore control index + optional ScraperFC/Sofascore momentum
+│   ├── live.py                # ESPN scoreboard/commentary connectors + minute mapping
 │   ├── pipeline.py            # Live-first DuckDB ingestion, parsing, and Parquet pipeline
 │   └── app.py                 # Streamlit frontend: live mode (60s auto-refresh), simulator, committed state
 ├── tests/
@@ -101,4 +104,11 @@ WC-sentiment-Engine/
 
 **Deployed (2026-06-10):** Repository live at https://github.com/harshul27/WC-Sentiment-Engine. First production validation complete: CI green on GitHub runners, manual flywheel run passed the test gate, ingested, self-corrected, and autonomously committed `data/state.parquet` + `model_config.json` back to main (`0daaa4e`). Dependabot immediately opened 3 update PRs, each gated by CI — the security loop is functioning.
 
-**Next Session Focus:** Deploy `src/app.py` on Streamlit Community Cloud (point it at the repo, main branch); set `STATE_PARQUET_URL=https://raw.githubusercontent.com/harshul27/WC-Sentiment-Engine/main/data/state.parquet`. Enable branch protection on `main` requiring the CI checks. Tournament starts 2026-06-11 19:00 UTC (MEX–RSA) — first live validation window.
+**Completed (2026-06-11, emotion intelligence & product pass):**
+16. `src/emotion.py` — custom vectorized 6-emotion classifier (panic/anger/joy/confidence/despair/surprise) with per-minute distributions, dominant-emotion tracking, mood-volatility index, emotion-derived panic score, and a rule-based takeaway generator that relates crowd emotion to match state in plain language.
+17. `src/sources.py` — multi-platform reaction aggregator, unified schema, 200-comment rolling window (`COMMENT_WINDOW`). Keyless: Bluesky + Mastodon. Key-gated (free tiers): Reddit match-thread comments (`REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`), YouTube live chat (`YOUTUBE_API_KEY`, ~105 units/poll). Verified live: 200/200 window filled (116 Mastodon + 84 Bluesky).
+18. `src/matchstats.py` — ESPN boxscore (possession/shots/on-target/corners/saves, keyless, cloud-safe, verified vs 2022 final) → weighted match-control index; Sofascore attack momentum via ScraperFC behind `ENABLE_SOFASCORE=1` (Sofascore 403s plain HTTP and blocked botasaurus during testing — best-effort local enrichment only, NOT in requirements.txt).
+19. Dashboard v2 — emotion area chart, crowd-mood badges, "What This Means Right Now" takeaway panel, source-labelled reaction window. State schema extended with emo_* shares, dominant_emotion, emotional_volatility, comment_volume.
+20. Suite now 64 tests, all offline. First REAL live ingestion achieved during the MEX–RSA opener: `match_id=ESPN-760415`, 115 minutes scored, 2 arbitrage flags.
+
+**Next Session Focus:** Redeploy/reboot Streamlit Cloud app to pick up the emotion dashboard. Optional keys to add as secrets for deeper coverage: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET` (free script app at reddit.com/prefs/apps), `YOUTUBE_API_KEY` (free Data API). Evaluate emotion-lexicon expansion from real tournament chatter; consider Sofascore retry locally with `ENABLE_SOFASCORE=1`.

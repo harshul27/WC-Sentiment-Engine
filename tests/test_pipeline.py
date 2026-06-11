@@ -22,7 +22,8 @@ def test_simulate_streams_is_deterministic() -> None:
 
 def test_simulate_streams_schema_and_coverage() -> None:
     chat, commentary = pipeline.simulate_streams(seed=1, minutes=45)
-    assert list(chat.columns) == ["minute", "message"]
+    assert list(chat.columns) == ["minute", "message", "source"]
+    assert (chat["source"] == "simulator").all()
     assert int(chat["minute"].max()) == 45
     assert len(commentary) == 46
     assert commentary.str.match(r"^\d+' ").all()
@@ -126,6 +127,9 @@ def test_run_ingest_and_optimize_end_to_end(
     assert (tmp_path / "state.parquet").exists()
     assert len(state) == 91
     assert state["arbitrage_index"].between(0.0, 1.0).all()
+    assert "dominant_emotion" in state.columns
+    assert "emo_panic" in state.columns
+    assert not state["emo_panic"].isna().any()
 
     result = pipeline.run_optimize()
     assert 0.05 <= result["arbitrage_flag_threshold"] <= 0.95

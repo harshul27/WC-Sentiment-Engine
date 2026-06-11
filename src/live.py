@@ -184,7 +184,8 @@ def posts_to_chat(
         )
     elapsed = (stamps.loc[recent.index] - kickoff).dt.total_seconds() // 60
     recent["minute"] = elapsed.clip(lower=0, upper=max_minute).astype("int64")
-    return recent[["minute", "message"]].reset_index(drop=True)
+    columns = ["minute", "message"] + (["source"] if "source" in recent.columns else [])
+    return recent[columns].reset_index(drop=True)
 
 
 def current_live_match(scoreboard: pd.DataFrame | None = None) -> pd.Series | None:
@@ -199,10 +200,12 @@ def current_live_match(scoreboard: pd.DataFrame | None = None) -> pd.Series | No
 
 
 def live_streams(match: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
-    """Fetch both live inputs (fan chat, commentary) for one fixture."""
+    """Fetch both live inputs (multi-source fan chat, commentary)."""
+    import sources
+
     commentary = fetch_match_commentary(str(match["event_id"]))
-    terms = [t for t in (match.get("home_team"), match.get("away_team")) if t]
-    posts = fetch_crowd_posts([str(t) for t in terms])
+    terms = [str(t) for t in (match.get("home_team"), match.get("away_team")) if t]
+    posts = sources.gather_reactions(terms)
     chat = posts_to_chat(posts, match["kickoff_utc"])
     return chat, commentary
 

@@ -27,10 +27,10 @@ from bs4 import BeautifulSoup
 sys.path.append(str(Path(__file__).resolve().parent))
 
 import live
+from emotion import EMOTION_COLUMNS, EmotionAgent
 from model import (
     ArbitrageSelector,
     MatchProgressionAgent,
-    SocialListeningAgent,
     grid_search_threshold,
     load_config,
     parse_commentary,
@@ -112,6 +112,7 @@ def simulate_streams(seed: int, minutes: int = 90) -> tuple[pd.DataFrame, pd.Ser
     chat = pd.DataFrame(chat_rows, columns=["minute", "message"]).astype(
         {"minute": "int64", "message": "str"}
     )
+    chat["source"] = "simulator"
     return chat, pd.Series(commentary, dtype="str", name="line")
 
 
@@ -189,17 +190,33 @@ def gather_streams() -> tuple[pd.DataFrame, pd.Series, str]:
     return chat, commentary, f"SIM-{seed}"
 
 
+def fill_emotion_columns(state: pd.DataFrame) -> pd.DataFrame:
+    """Carry emotion fields across minutes the chat stream didn't cover."""
+    for column in (*EMOTION_COLUMNS, "emotional_volatility"):
+        if column in state.columns:
+            state[column] = state[column].ffill().fillna(0.0)
+    if "dominant_emotion" in state.columns:
+        state["dominant_emotion"] = state["dominant_emotion"].ffill().fillna("neutral")
+    if "comment_volume" in state.columns:
+        state["comment_volume"] = (
+            state["comment_volume"].ffill().fillna(0).astype("int64")
+        )
+    return state
+
+
 def run_ingest() -> pd.DataFrame:
     """Full ingestion pass: streams -> agents -> DuckDB -> state.parquet."""
     config = load_config(str(CONFIG_PATH))
     params = config["hyperparameters"]
     chat, commentary, match_id = gather_streams()
-    social_agent = SocialListeningAgent(window_minutes=5)
+    social_agent = EmotionAgent(window_minutes=5)
     match_agent = MatchProgressionAgent(
         window_minutes=int(params["xg_rolling_window_minutes"])
     )
     selector = ArbitrageSelector(threshold=float(params["arbitrage_flag_threshold"]))
-    state = selector.run(social_agent.run(chat), match_agent.run(commentary))
+    state = fill_emotion_columns(
+        selector.run(social_agent.run(chat), match_agent.run(commentary))
+    )
     state.insert(0, "match_id", match_id)
     events = parse_commentary(commentary)
     persist_to_duckdb(chat, commentary, events, state, DB_PATH, STATE_PATH)
