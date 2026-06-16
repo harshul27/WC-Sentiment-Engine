@@ -118,19 +118,26 @@ def test_gather_streams_falls_back_when_live_commentary_empty(
     assert match_row is None
 
 
-def test_run_ingest_and_optimize_end_to_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def _patch_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     config_path = tmp_path / "model_config.json"
     monkeypatch.setattr(pipeline, "DB_PATH", tmp_path / "database.duckdb")
     monkeypatch.setattr(pipeline, "STATE_PATH", tmp_path / "state.parquet")
+    monkeypatch.setattr(pipeline, "STATUS_PATH", tmp_path / "run_status.json")
     monkeypatch.setattr(pipeline, "CONFIG_PATH", config_path)
+    return config_path
+
+
+def test_run_ingest_simulator_writes_state_and_heartbeat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_paths(tmp_path, monkeypatch)
     monkeypatch.setattr(
         pipeline.live, "current_capture_match", lambda scoreboard=None, now=None: None
     )
 
     state = pipeline.run_ingest()
     assert (tmp_path / "state.parquet").exists()
+    assert (tmp_path / "run_status.json").exists()
     assert len(state) == 91
     assert state["arbitrage_index"].between(0.0, 1.0).all()
     assert "dominant_emotion" in state.columns
@@ -139,13 +146,105 @@ def test_run_ingest_and_optimize_end_to_end(
     assert "situation" in state.columns
     assert state["situation"].isin(list(__import__("situation").PROTOTYPES)).all()
     assert state["situation_confidence"].between(0, 1).all()
+    status = json.loads((tmp_path / "run_status.json").read_text(encoding="utf-8"))
+    assert status["source"] == "simulator"
+    assert status["live"] is False
+
+
+def test_run_optimize_skips_without_real_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The simulator must never tune the live threshold: with no archived
+    real matches, optimize is a no-op that leaves the config untouched."""
+    config_path = _patch_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        pipeline.live, "current_capture_match", lambda scoreboard=None, now=None: None
+    )
+    pipeline.run_ingest()  # simulator state only, no archive written
 
     result = pipeline.run_optimize()
+    assert result["status"] == "skipped"
+    assert result["arbitrage_flag_threshold"] == 0.65  # default, untouched
+    # A true no-op: skipping never rewrites the config.
+    assert not config_path.exists()
+
+
+def test_run_optimize_trains_on_archive_corpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With enough archived real-match minutes spanning both outcome classes,
+    optimize fits the threshold and records the run."""
+    config_path = _patch_paths(tmp_path, monkeypatch)
+    archive_path = tmp_path / "match_archive.parquet"
+
+    def _match_state(panic_block: range) -> pd.DataFrame:
+        minutes = 100
+        panic = np.array(
+            [0.8 if m in panic_block else 0.0 for m in range(minutes)], dtype=float
+        )
+        return pd.DataFrame(
+            {
+                "minute": range(minutes),
+                "crowd_panic_score": panic,
+                "rolling_xg": np.full(minutes, 0.05),  # flat: no threat arrives
+                "delta_xg_10min": np.full(minutes, 0.05),
+                "arbitrage_index": np.abs(panic) * 0.95,
+                "flagged": panic > 0.4,
+                "dominant_emotion": ["panic" if p > 0.4 else "neutral" for p in panic],
+                "emotional_volatility": np.full(minutes, 0.2),
+                "comment_volume": np.full(minutes, 4),
+                **{col: np.full(minutes, 0.1) for col in __import__("archive").EMOTION_COLUMNS},
+            }
+        )
+
+    archive_mod = __import__("archive")
+    base_meta = {
+        "home_team": "A",
+        "away_team": "B",
+        "kickoff_utc": pd.Timestamp("2026-06-11T19:00Z"),
+        "final_score": "1-0",
+        "state": "post",
+    }
+    for mid, block in (("ESPN-1", range(40, 60)), ("ESPN-2", range(50, 70))):
+        archive_mod.archive_match(
+            _match_state(block),
+            {**base_meta, "match_id": mid},
+            db_path=tmp_path / "database.duckdb",
+            archive_path=archive_path,
+            results_path=tmp_path / "match_results.parquet",
+        )
+
+    result = pipeline.run_optimize(min_minutes=180)
+    assert result.get("status") != "skipped"
     assert 0.05 <= result["arbitrage_flag_threshold"] <= 0.95
     assert np.isfinite(result["log_loss"])
     saved = json.loads(config_path.read_text(encoding="utf-8"))
-    assert saved["hyperparameters"]["arbitrage_flag_threshold"] == result[
-        "arbitrage_flag_threshold"
-    ]
     assert len(saved["log_loss_history"]) == 1
-    assert saved["log_loss_history"][0]["evaluated_minutes"] == 91
+    assert saved["log_loss_history"][0]["evaluated_minutes"] == 200
+    assert saved["log_loss_history"][0]["matches"] == 2
+
+
+def test_gather_streams_live_only_returns_none_sentinel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        pipeline.live, "current_capture_match", lambda scoreboard=None, now=None: None
+    )
+    chat, commentary, match_id, match_row = pipeline.gather_streams(allow_simulator=False)
+    assert match_id.startswith("NONE-")
+    assert commentary.empty
+    assert chat.empty
+    assert match_row is None
+
+
+def test_run_ingest_live_only_skips_when_no_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_paths(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        pipeline.live, "current_capture_match", lambda scoreboard=None, now=None: None
+    )
+    state = pipeline.run_ingest(allow_simulator=False)
+    assert state.empty
+    assert not (tmp_path / "state.parquet").exists()
+    assert not (tmp_path / "run_status.json").exists()

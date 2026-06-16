@@ -10,3 +10,6 @@ __pycache__/
 
 # botasaurus/ScraperFC artifacts
 downloaded_files/
+
+# Isolated soccerdata install (nightly flywheel only; never the runner env)
+.soccerdata-venv/
