@@ -19,6 +19,7 @@ def no_external_keys(monkeypatch: pytest.MonkeyPatch) -> None:
         "REDDIT_CLIENT_ID",
         "REDDIT_CLIENT_SECRET",
         "YOUTUBE_API_KEY",
+        "XAI_API_KEY",
         "ENABLE_SOFASCORE",
     ):
         monkeypatch.delenv(key, raising=False)

@@ -47,7 +47,7 @@ WC-sentiment-Engine/
 ├── src/
 │   ├── model.py               # Vectorized sentiment math, agents, & arbitrage calculations
 │   ├── emotion.py             # Custom 6-emotion classifier, mood volatility, takeaway generator
-│   ├── sources.py             # Multi-source reaction aggregator (Bluesky/Mastodon keyless; Reddit/YouTube key-gated), 200-comment window
+│   ├── sources.py             # Multi-source reaction aggregator (Bluesky/Mastodon keyless; Reddit/YouTube/X key-gated), 200-comment window
 │   ├── matchstats.py          # ESPN boxscore control index + optional ScraperFC/Sofascore momentum
 │   ├── live.py                # ESPN connectors, minute mapping, capture_phase start/stop lifecycle
 │   ├── archive.py             # NOT NULL match archive: match_archive + match_results (DuckDB + Parquet mirror)
@@ -140,5 +140,8 @@ WC-sentiment-Engine/
 
 **Known follow-ups (require user action / deliberate non-goals):**
 - **Git binary bloat:** `*/20` Parquet commits during the tournament grow `main`'s history (binary blobs don't delta-compress). `--live-only` removed idle-commit churn; the full fix is an **orphan `data` branch** (or GH Releases) with Streamlit's `STATE_PARQUET_URL` repointed — deferred because it requires changing the deployed secret (avoided mid-tournament). 
-- Reboot Streamlit Cloud app (Python 3.13 + `STATE_PARQUET_URL` secret). Optional secrets: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`.
+- Reboot Streamlit Cloud app (Python 3.13 + `STATE_PARQUET_URL` secret). Optional secrets: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`, `XAI_API_KEY`.
 - Consider learning situation prototypes from the archive once more matchdays accumulate.
+
+**Completed (2026-06-16, X / Grok source):**
+36. `src/sources.py` `fetch_x` — recent X posts via the user's own xAI/Grok key, using the **X Search agent tool** (`POST https://api.x.ai/v1/responses`, model `grok-4.3`, `tools:[{"type":"x_search"}]`; the deprecated `search_parameters` Live Search was retired 2026-01-12). Grok is asked to return found posts as a JSON array; `_extract_response_text`/`_parse_post_json` tolerantly parse the `/responses` payload (both `output_text` and `output[]` message shapes), mapping to the unified `(created_utc, message, source="x")` schema with a now() timestamp fallback. Key-gated on `XAI_API_KEY` (overridable model via `XAI_MODEL`), broad-except → empty like every other connector, wired into `gather_reactions`. Tests: parse path, missing-timestamp fallback, malformed-JSON resilience, key-gated skip. Suite: **104 tests**. NOTE: X has no free public firehose — this bills against the user's personal xAI account, so it stays opt-in.

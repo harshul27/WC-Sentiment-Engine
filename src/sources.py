@@ -1,6 +1,6 @@
 """Multi-platform crowd reaction aggregator with a 200-comment window.
 
-Free sources, deepest coverage first:
+Sources, deepest coverage first:
 
   Bluesky   - public search API, no key required (always on)
   Mastodon  - public hashtag timelines, no key required (always on)
@@ -9,6 +9,10 @@ Free sources, deepest coverage first:
               REDDIT_CLIENT_SECRET are set
   YouTube   - live stream chat via the free YouTube Data API quota;
               activates when YOUTUBE_API_KEY is set
+  X         - recent posts via your own xAI/Grok key (the X Search agent
+              tool); activates when XAI_API_KEY is set. X has no free public
+              firehose, so this is the only first-party way to read X content
+              and it bills against your personal xAI account.
 
 Every connector returns the unified schema (created_utc, message, source)
 and degrades to an empty frame on any failure, so the aggregate is always
@@ -16,6 +20,7 @@ usable regardless of which credentials exist in the environment.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 
@@ -26,6 +31,10 @@ COMMENT_WINDOW = 200
 USER_AGENT = {"User-Agent": "wc-sentiment-engine/0.1"}
 BLUESKY_SEARCH = "https://api.bsky.app/xrpc/app.bsky.feed.searchPosts"
 MASTODON_INSTANCE = os.environ.get("MASTODON_INSTANCE", "https://mastodon.social")
+# xAI Agent Tools API (the deprecated search_parameters Live Search was
+# retired 2026-01-12); the X Search tool is grounded in live X posts.
+XAI_RESPONSES = "https://api.x.ai/v1/responses"
+XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4.3")
 
 _HTML_TAG = re.compile(r"<[^>]+>")
 
@@ -249,6 +258,90 @@ def fetch_youtube(query: str, limit: int = 100, timeout: float = 15.0) -> pd.Dat
     return _frame(rows)
 
 
+def _extract_response_text(payload: dict) -> str:
+    """Pull the assistant message text out of an xAI /responses payload.
+
+    Tolerant of both the convenience ``output_text`` field and the raw
+    ``output`` array of message items so a minor schema shift can't break it.
+    """
+    if isinstance(payload.get("output_text"), str):
+        return payload["output_text"]
+    chunks: list[str] = []
+    for item in payload.get("output", []) or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content", []) or []:
+            if isinstance(part, dict) and part.get("text"):
+                chunks.append(str(part["text"]))
+    return "\n".join(chunks)
+
+
+def _parse_post_json(text: str) -> list[dict[str, object]]:
+    """Extract the JSON array of posts the model was asked to return."""
+    if not text:
+        return []
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match is None:
+        return []
+    try:
+        data = json.loads(match.group())
+    except (json.JSONDecodeError, ValueError):
+        return []
+    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+
+
+def fetch_x(team_terms: list[str], limit: int = 50, timeout: float = 30.0) -> pd.DataFrame:
+    """Recent X posts about the fixture via xAI's Grok X Search tool.
+
+    Requires XAI_API_KEY (your own xAI/Grok key); silently skipped otherwise.
+    The X Search tool grounds Grok in live X posts; Grok is asked to return
+    them as a JSON array, which is mapped to the unified reaction schema.
+    Posts without a usable timestamp fall back to the current time so recent
+    reactions are still counted on the live tick.
+    """
+    key = os.environ.get("XAI_API_KEY", "")
+    terms = [str(t) for t in team_terms if t]
+    if not key or not terms:
+        return _empty()
+    focus = " vs ".join(terms[:2]) if len(terms) >= 2 else terms[0]
+    instruction = (
+        "Use X Search to find the most recent fan posts reacting to the live "
+        f"football match {focus}. Return ONLY a compact JSON array (no prose, no "
+        f"code fences) of up to {min(limit, 50)} objects, each with keys "
+        '"text" (the verbatim post text) and "created_at" (the post\'s ISO 8601 '
+        "timestamp). Exclude retweets, advertisements, and media-only posts."
+    )
+    payload = {
+        "model": XAI_MODEL,
+        "input": [{"role": "user", "content": instruction}],
+        "tools": [{"type": "x_search"}],
+    }
+    try:
+        response = requests.post(
+            XAI_RESPONSES,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        posts = _parse_post_json(_extract_response_text(response.json()))
+    except (requests.RequestException, ValueError):
+        return _empty()
+    now = pd.Timestamp.now(tz="UTC")
+    rows = [
+        {
+            "created_utc": post.get("created_at") or now,
+            "message": post.get("text", ""),
+            "source": "x",
+        }
+        for post in posts
+    ]
+    return _frame(rows)
+
+
 def gather_reactions(
     team_terms: list[str], window: int = COMMENT_WINDOW
 ) -> pd.DataFrame:
@@ -258,6 +351,7 @@ def gather_reactions(
         fetch_mastodon([*team_terms, "worldcup"]),
         fetch_reddit(team_terms),
         fetch_youtube(" vs ".join(team_terms[:2]) + " live"),
+        fetch_x(team_terms),
     ]
     merged = pd.concat([f for f in frames if not f.empty], ignore_index=True) if any(
         not f.empty for f in frames
