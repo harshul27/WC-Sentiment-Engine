@@ -59,9 +59,65 @@ def test_fetch_mastodon_strips_html(monkeypatch: pytest.MonkeyPatch) -> None:
     assert frame.loc[0, "source"] == "mastodon"
 
 
-def test_reddit_and_youtube_skip_without_credentials() -> None:
+def test_reddit_youtube_x_skip_without_credentials() -> None:
     assert sources.fetch_reddit(["Mexico"]).empty
     assert sources.fetch_youtube("Mexico vs South Africa live").empty
+    assert sources.fetch_x(["Mexico", "South Africa"]).empty
+
+
+def test_fetch_x_parses_grok_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "test-key")
+    body = (
+        'Here are the posts:\n[{"text": "we are choking again", '
+        '"created_at": "2026-06-11T19:20:00Z"}, '
+        '{"text": "what a save!!", "created_at": "2026-06-11T19:21:00Z"}]'
+    )
+    payload = {
+        "output": [
+            {"type": "x_search_call"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": body}],
+            },
+        ]
+    }
+    captured: dict[str, object] = {}
+
+    def fake_post(url: str, **kwargs: object) -> FakeResponse:
+        captured["url"] = url
+        captured["json"] = kwargs.get("json")
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(sources.requests, "post", fake_post)
+    frame = sources.fetch_x(["Mexico", "South Africa"])
+    assert len(frame) == 2
+    assert list(frame.columns) == sources.REACTION_COLUMNS
+    assert (frame["source"] == "x").all()
+    assert "choking" in frame.loc[0, "message"]
+    assert captured["url"] == sources.XAI_RESPONSES
+    assert captured["json"]["tools"][0]["type"] == "x_search"
+
+
+def test_fetch_x_handles_missing_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "test-key")
+    payload = {"output_text": '[{"text": "no timestamp here"}]'}
+    monkeypatch.setattr(
+        sources.requests, "post", lambda *a, **k: FakeResponse(payload)
+    )
+    frame = sources.fetch_x(["Mexico"])
+    assert len(frame) == 1
+    assert frame.loc[0, "message"] == "no timestamp here"
+    assert pd.notna(frame.loc[0, "created_utc"])
+
+
+def test_fetch_x_survives_malformed_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("XAI_API_KEY", "test-key")
+    payload = {"output_text": "the model rambled without returning any array"}
+    monkeypatch.setattr(
+        sources.requests, "post", lambda *a, **k: FakeResponse(payload)
+    )
+    assert sources.fetch_x(["Mexico"]).empty
 
 
 def test_fetchers_survive_network_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -94,6 +150,7 @@ def test_gather_reactions_caps_window_and_dedupes(
     monkeypatch.setattr(sources, "fetch_mastodon", lambda tags: duplicate)
     monkeypatch.setattr(sources, "fetch_reddit", lambda terms: sources._empty())
     monkeypatch.setattr(sources, "fetch_youtube", lambda query: sources._empty())
+    monkeypatch.setattr(sources, "fetch_x", lambda terms: sources._empty())
     merged = sources.gather_reactions(["Mexico", "South Africa"])
     assert len(merged) == sources.COMMENT_WINDOW
     assert merged["created_utc"].is_monotonic_increasing
@@ -101,6 +158,6 @@ def test_gather_reactions_caps_window_and_dedupes(
 
 
 def test_gather_reactions_all_sources_empty(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in ("fetch_bluesky", "fetch_mastodon", "fetch_reddit", "fetch_youtube"):
+    for name in ("fetch_bluesky", "fetch_mastodon", "fetch_reddit", "fetch_youtube", "fetch_x"):
         monkeypatch.setattr(sources, name, lambda *a, **k: sources._empty())
     assert sources.gather_reactions(["Mexico"]).empty

@@ -36,8 +36,11 @@ jobs:
         if: github.event.schedule == '0 0 * * *' || github.event_name == 'workflow_dispatch'
         run: python -m pytest tests -q
 
+      # --live-only: never overwrite committed production state with the
+      # deterministic simulator. Between matches this writes nothing, so idle
+      # ticks produce no commits and the dashboard never shows a fake match.
       - name: Run live-first ingestion & arbitrage scoring
-        run: python src/pipeline.py run
+        run: python src/pipeline.py run --live-only
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -48,19 +51,37 @@ jobs:
         run: python src/pipeline.py optimize
 
       # soccerdata needs rich>=14 while streamlit pins rich<14, so it is
-      # installed ad hoc here (last step, ephemeral runner) instead of in
-      # requirements.txt where it would make resolution impossible.
+      # installed into an isolated throwaway venv (never the runner env that
+      # just ran streamlit-pinned code) instead of requirements.txt where it
+      # would make resolution impossible.
       - name: Refresh FBref team priors via soccerdata (best effort)
         if: github.event.schedule == '0 0 * * *' || github.event_name == 'workflow_dispatch'
         continue-on-error: true
         run: |
-          pip install soccerdata==1.9.0
-          python src/advanced.py refresh
+          python -m venv .soccerdata-venv
+          ./.soccerdata-venv/bin/pip install --quiet soccerdata==1.9.0 pandas pyarrow
+          ./.soccerdata-venv/bin/python src/advanced.py refresh
 
+      # Concurrent pushes (Dependabot, manual, a queued tick) would reject a
+      # bare push and silently drop this tick's data; rebase-and-retry keeps
+      # our freshly regenerated Parquet (-X theirs) and never loses a capture.
       - name: Commit refreshed state
         run: |
           git config user.name "engine-flywheel[bot]"
           git config user.email "engine-flywheel[bot]@users.noreply.github.com"
           git add -A data/
-          git diff --cached --quiet || git commit -m "chore: refresh operational state [skip ci]"
-          git push
+          if git diff --cached --quiet; then
+            echo "No state changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: refresh operational state [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed on attempt ${attempt}."
+              exit 0
+            fi
+            echo "Push rejected (attempt ${attempt}); rebasing on origin/main..."
+            git pull --rebase -X theirs origin main || true
+          done
+          echo "::error::Failed to push refreshed state after 5 attempts."
+          exit 1

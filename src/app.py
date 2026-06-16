@@ -16,13 +16,15 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import requests
 import streamlit as st
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
+import health
 from advanced import fixture_prior
 from archive import load_archive
-from emotion import EMOTION_COLUMNS, EmotionAgent, generate_takeaways
+from emotion import EMOTION_COLUMNS, EmotionAgent, generate_takeaways, scored_share
 from live import POST_GRACE, capture_phase, fetch_scoreboard, live_streams, utc_now
 from matchstats import control_index, fetch_boxscore
 from model import ArbitrageSelector, MatchProgressionAgent, load_config
@@ -31,6 +33,7 @@ from situation import classify, metrics_that_matter, situation_brief
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / "data" / "state.parquet"
+STATUS_PATH = ROOT / "data" / "run_status.json"
 CONFIG_PATH = ROOT / "data" / "model_config.json"
 CHART_COLUMNS = ["crowd_panic_score", "delta_xg_10min", "arbitrage_index"]
 MODE_LIVE = "🔴 Live match"
@@ -62,6 +65,36 @@ def load_state() -> pd.DataFrame:
 @st.cache_data(ttl=55, show_spinner=False)
 def load_scoreboard() -> pd.DataFrame:
     return fetch_scoreboard()
+
+
+@st.cache_data(ttl=55, show_spinner=False)
+def load_run_status() -> dict | None:
+    """Engine heartbeat: local file first, then the committed raw URL sibling."""
+    status = health.load_status(STATUS_PATH)
+    if status is not None:
+        return status
+    raw_url = os.environ.get("STATE_PARQUET_URL", "")
+    if raw_url and "/" in raw_url:
+        status_url = raw_url.rsplit("/", 1)[0] + "/run_status.json"
+        try:
+            response = requests.get(status_url, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except (requests.RequestException, ValueError):
+            return None
+    return None
+
+
+def render_status_badge() -> None:
+    """LIVE / STALE / DEGRADED / NO-DATA badge so an outage never reads as calm."""
+    verdict = health.freshness(load_run_status())
+    detail = f"**{verdict['label']}** — {verdict['detail']}"
+    if verdict["level"] == "live":
+        st.success(detail)
+    elif verdict["level"] in ("stale", "degraded"):
+        st.warning(detail)
+    else:
+        st.info(detail)
 
 
 @st.cache_data(show_spinner="Simulating live match streams...")
@@ -199,6 +232,13 @@ def render_reactions(chat: pd.DataFrame) -> None:
                 "Sources: "
                 + ", ".join(f"{src} {n}" for src, n in counts.items())
             )
+        if "message" in chat.columns:
+            share = scored_share(chat["message"])
+            st.caption(
+                f"Emotion-lexicon coverage: {share:.0%} of comments matched a "
+                "term (English + major non-English + emoji). Lower coverage means "
+                "the panic score rests on a smaller slice of the crowd."
+            )
         st.dataframe(chat.tail(30), use_container_width=True, hide_index=True)
 
 
@@ -299,7 +339,14 @@ def live_panel(event_id: str) -> None:
 
     chat, commentary = live_streams(match)
     if commentary.empty:
-        st.info("Waiting for the first commentary entries from the feed...")
+        if str(match["state"]) == "in":
+            st.warning(
+                "⚠️ Match is in progress but the commentary feed returned nothing — "
+                "the ESPN source may be rate-limited or briefly unreachable. "
+                "Retrying automatically; this is a source outage, not a quiet crowd."
+            )
+        else:
+            st.info("Waiting for the first commentary entries from the feed...")
         return
     state = run_selector(chat, commentary)
     if state.empty:
@@ -359,6 +406,7 @@ def render_simulator_mode(seed: int, speed: float) -> None:
 
 
 def render_state_mode() -> None:
+    render_status_badge()
     state = load_state()
     if state.empty:
         st.warning(
@@ -384,6 +432,11 @@ def main() -> None:
     st.caption(
         "Wisdom-of-crowds divergence tracker: crowd emotions vs. real match "
         "stability, flagged when sentiment decouples from the pitch."
+    )
+    st.caption(
+        "ℹ️ The Arbitrage Index measures **sentiment–pitch divergence** as a "
+        "proxy for potential market overreaction. It is not connected to any "
+        "live betting market and is not financial or betting advice."
     )
 
     with st.sidebar:

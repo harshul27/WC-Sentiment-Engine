@@ -47,23 +47,26 @@ WC-sentiment-Engine/
 ├── src/
 │   ├── model.py               # Vectorized sentiment math, agents, & arbitrage calculations
 │   ├── emotion.py             # Custom 6-emotion classifier, mood volatility, takeaway generator
-│   ├── sources.py             # Multi-source reaction aggregator (Bluesky/Mastodon keyless; Reddit/YouTube key-gated), 200-comment window
+│   ├── sources.py             # Multi-source reaction aggregator (Bluesky/Mastodon keyless; Reddit/YouTube/X key-gated), 200-comment window
 │   ├── matchstats.py          # ESPN boxscore control index + optional ScraperFC/Sofascore momentum
 │   ├── live.py                # ESPN connectors, minute mapping, capture_phase start/stop lifecycle
 │   ├── archive.py             # NOT NULL match archive: match_archive + match_results (DuckDB + Parquet mirror)
 │   ├── situation.py           # Real-time nearest-centroid match-situation classifier + metrics playbook
 │   ├── advanced.py            # soccerdata/FBref team priors (nightly best-effort refresh -> team_priors.parquet)
-│   ├── pipeline.py            # Live-first DuckDB ingestion, parsing, and Parquet pipeline
+│   ├── health.py              # Run heartbeat + LIVE/STALE/DEGRADED/NO-DATA freshness (run_status.json)
+│   ├── pipeline.py            # Live-first DuckDB ingestion, parsing, Parquet pipeline, corpus self-correction
 │   └── app.py                 # Streamlit frontend: live mode (60s auto-refresh), simulator, committed state
 ├── tests/
 │   ├── conftest.py            # src path setup + offline/no-LLM-key isolation fixture
 │   ├── test_model.py          # Unit tests: sentiment math, parsing, equation, grid search
 │   ├── test_live.py           # Offline fixture tests for ESPN/Bluesky parsers & failure paths
-│   ├── test_pipeline.py       # Integration tests: DuckDB, Parquet, source selection, self-correction
+│   ├── test_pipeline.py       # Integration tests: DuckDB, Parquet, source selection, corpus self-correction
+│   ├── test_health.py         # Heartbeat + freshness-badge classification
 │   └── test_app.py            # Streamlit AppTest smoke tests across display modes
 ├── data/
 │   ├── database.duckdb        # Local testing instance (Git-ignored)
 │   ├── model_config.json      # Dynamic hyperparameters & log-loss backpropagation history
+│   ├── run_status.json        # Engine heartbeat (source/freshness) for the dashboard badge
 │   └── state.parquet          # Compressed operational UI dataset source
 ├── requirements.txt           # Explicitly pinned runtime library weights (CVE-audited)
 ├── requirements-dev.txt       # Pinned test & security tooling (pytest/ruff/bandit/pip-audit)
@@ -103,7 +106,7 @@ WC-sentiment-Engine/
 14. `engine_flywheel.yml` dual cron — `*/20 * * * *` live refresh (commit step no-ops when state unchanged, so off-match ticks produce no commits) + `0 0 * * *` nightly test-gated self-correction.
 15. Real-data regression fixed: Bluesky mixed-precision timestamps coerced via `pd.to_datetime(utc=True)` in `posts_to_chat`. Suite now 37 tests, all offline/deterministic.
 
-**Real-time latency profile:** portal open during a match ≈ 60s end-to-end; committed state for closed browsers ≈ 20 min via Actions; sentiment source is Bluesky (free X/YouTube firehoses do not exist).
+**Real-time latency profile (honest):** *Live mode* (browser open, app fetches ESPN directly) ≈ 60s, bounded by ESPN responsiveness. *Committed-state mode* is NOT 60s end-to-end: it is bounded by the `*/20` flywheel cron **plus** `raw.githubusercontent.com` CDN caching (~5 min), so realistic staleness is ~5–25 min. The dashboard now shows a LIVE/STALE/DEGRADED/NO-DATA badge (see entry 32) so users see the true freshness. Sentiment sources are Bluesky + Mastodon keyless (free X/YouTube firehoses do not exist).
 
 **Deployed (2026-06-10):** Repository live at https://github.com/harshul27/WC-Sentiment-Engine. First production validation complete: CI green on GitHub runners, manual flywheel run passed the test gate, ingested, self-corrected, and autonomously committed `data/state.parquet` + `model_config.json` back to main (`0daaa4e`). Dependabot immediately opened 3 update PRs, each gated by CI — the security loop is functioning.
 
@@ -126,4 +129,19 @@ WC-sentiment-Engine/
 27. Archive hardening: **fixed ephemeral-runner data-loss bug** (tables are now seeded from the committed Parquet mirrors before every upsert — previously a fresh runner's empty DuckDB would clobber the archive to a single match). Schema extended with `situation`/`situation_confidence` (NOT NULL + CHECK), with automatic migration of pre-classifier archives (defaults 'unknown'/0.0). Both covered by regression tests.
 28. State/archive rows now carry the classification; dashboard adds a "Match Situation" panel (situation badge, confidence, dynamic metrics-that-matter row, playbook read, priors note). Suite: 90 tests.
 
-**Next Session Focus:** Wire `run_optimize` to train on the growing `match_archive` + `match_results` corpus (real outcomes) instead of simulated ground truth once a few matches accumulate; consider learning situation prototypes from archived data the same way. Reboot Streamlit Cloud app. Optional secrets: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`.
+**Completed (2026-06-14, second-order hardening pass):** A `/second-order-thinker` review surfaced criticalities; all resolved:
+29. **Self-correction no longer trains on fiction.** `run_optimize` now trains on the committed `match_archive` corpus (real ESPN fixtures only — the simulator is structurally excluded since it is never archived), with guards: it **skips** (true no-op, config untouched) until ≥ `MIN_TRAIN_MINUTES` (180) of real minutes spanning **both** outcome classes accumulate, so one match or an idle night can never dictate the production threshold. New `derive_corpus_truth` derives outcome labels per match from the *forward* rising-edge of archived rolling xG (panic that the pitch never vindicated) — forward-looking, so not circular with the current-minute arbitrage index. Old `derive_overreaction_truth` retained for its unit test. Corpus path derives from `DB_PATH.parent` for test isolation.
+30. **No more fake data in production state.** `run_ingest(allow_simulator=...)` + new `NONE-` sentinel in `gather_streams`; the live flywheel tick runs `pipeline.py run --live-only`, so between matches it writes **nothing** (no committed simulator state, no idle commits). Local dev/`all` keep the simulator default.
+31. **Push can't silently drop a tick.** Flywheel commit step is now rebase-and-retry (5 attempts, `git pull --rebase -X theirs origin main` keeps our freshly regenerated Parquet) instead of a bare `git push`.
+32. **Outages are now visible.** New `src/health.py` writes a `data/run_status.json` heartbeat each persisted run (source/live/fetch_ok/reaction counts/last_run_utc); dashboard `render_status_badge` turns it into LIVE/STALE/DEGRADED/NO-DATA via `health.freshness`, and live mode distinguishes "source unreachable mid-match" from "pre-match/quiet". A broken pipeline can no longer masquerade as a calm crowd.
+33. **Emotion model de-biased for a global crowd.** `emotion.py` lexicons extended with high-volume es/pt/fr football terms + reaction emoji; new `scored_share` exposes lexicon coverage (surfaced in the reactions panel) so the English-only bias is measurable.
+34. **soccerdata isolated.** Nightly priors step installs soccerdata into a throwaway `.soccerdata-venv` (gitignored), never mutating the streamlit-pinned runner env before the commit step.
+35. **Honesty framing.** Dashboard caption clarifies the Arbitrage Index is a **sentiment–pitch divergence proxy**, not a live betting market and not financial advice (a true odds feed is a deliberate non-goal for cost/safety). Suite: **101 tests**, ruff + bandit clean.
+
+**Known follow-ups (require user action / deliberate non-goals):**
+- **Git binary bloat:** `*/20` Parquet commits during the tournament grow `main`'s history (binary blobs don't delta-compress). `--live-only` removed idle-commit churn; the full fix is an **orphan `data` branch** (or GH Releases) with Streamlit's `STATE_PARQUET_URL` repointed — deferred because it requires changing the deployed secret (avoided mid-tournament). 
+- Reboot Streamlit Cloud app (Python 3.13 + `STATE_PARQUET_URL` secret). Optional secrets: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`, `XAI_API_KEY`.
+- Consider learning situation prototypes from the archive once more matchdays accumulate.
+
+**Completed (2026-06-16, X / Grok source):**
+36. `src/sources.py` `fetch_x` — recent X posts via the user's own xAI/Grok key, using the **X Search agent tool** (`POST https://api.x.ai/v1/responses`, model `grok-4.3`, `tools:[{"type":"x_search"}]`; the deprecated `search_parameters` Live Search was retired 2026-01-12). Grok is asked to return found posts as a JSON array; `_extract_response_text`/`_parse_post_json` tolerantly parse the `/responses` payload (both `output_text` and `output[]` message shapes), mapping to the unified `(created_utc, message, source="x")` schema with a now() timestamp fallback. Key-gated on `XAI_API_KEY` (overridable model via `XAI_MODEL`), broad-except → empty like every other connector, wired into `gather_reactions`. Tests: parse path, missing-timestamp fallback, malformed-JSON resilience, key-gated skip. Suite: **104 tests**. NOTE: X has no free public firehose — this bills against the user's personal xAI account, so it stays opt-in.

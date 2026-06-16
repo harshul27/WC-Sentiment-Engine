@@ -14,6 +14,7 @@ from emotion import (
     generate_takeaways,
     minute_profile,
     panic_from_profile,
+    scored_share,
 )
 
 
@@ -35,6 +36,29 @@ def test_classify_comments_fires_each_emotion() -> None:
     assert scores.loc[3, "emo_confidence"] > 0
     assert scores.loc[4, "emo_despair"] > 0
     assert scores.loc[5, "emo_surprise"] > 0
+
+
+def test_classify_comments_handles_non_english_and_emoji() -> None:
+    samples = pd.Series(
+        [
+            "que golazo increible",  # es joy
+            "roubo, vergonha do arbitro",  # pt/es anger
+            "se acabó, estamos eliminados 😭",  # es despair + emoji
+            "😡🤬 robo",  # emoji anger
+        ]
+    )
+    scores = classify_comments(samples)
+    assert scores.loc[0, "emo_joy"] > 0
+    assert scores.loc[1, "emo_anger"] > 0
+    assert scores.loc[2, "emo_despair"] > 0
+    assert scores.loc[3, "emo_anger"] > 0
+
+
+def test_scored_share_reflects_coverage() -> None:
+    assert scored_share(pd.Series(["total panic", "golazo"])) == pytest.approx(1.0)
+    assert scored_share(pd.Series(["panic now", "nice weather today"])) == pytest.approx(0.5)
+    assert scored_share(pd.Series(["just some neutral text", "more neutral text"])) == 0.0
+    assert scored_share(pd.Series([], dtype="str")) == 0.0
 
 
 def test_emotion_shares_normalize_and_keep_neutral_zero() -> None:

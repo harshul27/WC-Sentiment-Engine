@@ -27,6 +27,7 @@ from bs4 import BeautifulSoup
 sys.path.append(str(Path(__file__).resolve().parent))
 
 import archive
+import health
 import live
 import situation
 from emotion import EMOTION_COLUMNS, EmotionAgent
@@ -44,6 +45,13 @@ DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "database.duckdb"
 STATE_PATH = DATA_DIR / "state.parquet"
 CONFIG_PATH = DATA_DIR / "model_config.json"
+STATUS_PATH = DATA_DIR / "run_status.json"
+
+# Self-correction guards: never tune the live threshold on a thin or absent
+# real-match corpus (a single match would let one game dictate the threshold),
+# and never on the simulator. The corpus is the committed archive, which only
+# ever holds real ESPN fixtures.
+MIN_TRAIN_MINUTES = 180
 
 TEAMS: tuple[str, str] = ("Brazil", "Argentina")
 
@@ -174,11 +182,16 @@ def persist_to_duckdb(
         connection.close()
 
 
-def gather_streams() -> tuple[pd.DataFrame, pd.Series, str, pd.Series | None]:
+def gather_streams(
+    allow_simulator: bool = True,
+) -> tuple[pd.DataFrame, pd.Series, str, pd.Series | None]:
     """Source selection: live or post-window ESPN match -> feed URL -> simulator.
 
     Returns (chat, commentary, match_id, match_row); match_row is the
-    scoreboard row when a real fixture was captured, else None.
+    scoreboard row when a real fixture was captured, else None. When
+    allow_simulator is False and no real source is available, the match_id is
+    the ``NONE-`` sentinel so callers can skip writing simulated data into the
+    committed production state.
     """
     seed = int(date.today().strftime("%Y%m%d"))
     match = live.current_capture_match()
@@ -192,6 +205,11 @@ def gather_streams() -> tuple[pd.DataFrame, pd.Series, str, pd.Series | None]:
         if not scraped.empty:
             chat, _ = simulate_streams(seed)
             return chat, scraped, f"FEED-{seed}", None
+    if not allow_simulator:
+        empty_chat = pd.DataFrame(columns=["minute", "message", "source"]).astype(
+            {"minute": "int64", "message": "str", "source": "str"}
+        )
+        return empty_chat, pd.Series(dtype="str", name="line"), f"NONE-{seed}", None
     chat, commentary = simulate_streams(seed)
     return chat, commentary, f"SIM-{seed}", None
 
@@ -210,11 +228,20 @@ def fill_emotion_columns(state: pd.DataFrame) -> pd.DataFrame:
     return state
 
 
-def run_ingest() -> pd.DataFrame:
-    """Full ingestion pass: streams -> agents -> DuckDB -> state.parquet."""
+def run_ingest(allow_simulator: bool = True) -> pd.DataFrame:
+    """Full ingestion pass: streams -> agents -> DuckDB -> state.parquet.
+
+    When allow_simulator is False (the live flywheel tick) and no real match
+    is available, the committed production state is left untouched rather than
+    being overwritten with simulated data - so the dashboard never shows a fake
+    match between fixtures, and idle ticks produce no commits.
+    """
     config = load_config(str(CONFIG_PATH))
     params = config["hyperparameters"]
-    chat, commentary, match_id, match_row = gather_streams()
+    chat, commentary, match_id, match_row = gather_streams(allow_simulator=allow_simulator)
+    if match_id.startswith("NONE-"):
+        print("[run] no live or post-window match; committed state left unchanged")
+        return pd.DataFrame()
     social_agent = EmotionAgent(window_minutes=5)
     match_agent = MatchProgressionAgent(
         window_minutes=int(params["xg_rolling_window_minutes"])
@@ -245,6 +272,9 @@ def run_ingest() -> pd.DataFrame:
             archive_path=DB_PATH.parent / "match_archive.parquet",
             results_path=DB_PATH.parent / "match_results.parquet",
         )
+    health.write_status(
+        health.stream_health(chat, commentary, match_id), STATUS_PATH
+    )
     print(
         f"[run] match_id={match_id} rows={len(state)} "
         f"flagged_minutes={flagged} archived_rows={archived}"
@@ -272,19 +302,64 @@ def derive_overreaction_truth(
     return pd.Series((panicking & ~upcoming).astype(np.float64), name="overreaction")
 
 
-def run_optimize() -> dict[str, float]:
-    """Nightly MLOps loop: re-fit the flag threshold and persist the config."""
-    if not DB_PATH.exists():
-        run_ingest()
-    connection = duckdb.connect(str(DB_PATH), read_only=True)
-    try:
-        state = connection.execute("SELECT * FROM arbitrage_state ORDER BY minute").df()
-        events = connection.execute("SELECT * FROM match_events ORDER BY minute").df()
-    finally:
-        connection.close()
-    truth = derive_overreaction_truth(state, events)
-    result = grid_search_threshold(state["arbitrage_index"], truth)
+def derive_corpus_truth(
+    corpus: pd.DataFrame, horizon: int = 15, threat_floor: float = 0.30
+) -> pd.Series:
+    """Outcome-grounded labels from the archived real-match corpus.
+
+    For each match, a minute is a genuine arbitrage moment (1.0) when the
+    crowd was clearly panicking yet no real attacking threat arrived over the
+    next ``horizon`` minutes - i.e. the panic was never vindicated on the
+    pitch. The forward threat is approximated from the rising edge of the
+    archived rolling xG (a goal or big chance entering the window bumps it),
+    which is a different, forward-looking quantity from the current-minute
+    arbitrage index, so the label is not circular.
+    """
+    if corpus.empty:
+        return pd.Series(dtype="float64", name="overreaction")
+    labels = pd.Series(0.0, index=corpus.index, name="overreaction")
+    for _, group in corpus.groupby("match_id"):
+        ordered = group.sort_values("minute")
+        rolling = ordered["rolling_xg"].to_numpy(dtype=np.float64)
+        arrivals = np.clip(np.diff(rolling, prepend=rolling[:1]), 0.0, None)
+        forward = np.array(
+            [arrivals[i + 1 : i + 1 + horizon].sum() for i in range(len(arrivals))]
+        )
+        panicking = ordered["crowd_panic_score"].abs().to_numpy(dtype=np.float64) > 0.4
+        threat_arrived = forward >= threat_floor
+        labels.loc[ordered.index] = (panicking & ~threat_arrived).astype(np.float64)
+    return labels
+
+
+def run_optimize(min_minutes: int = MIN_TRAIN_MINUTES) -> dict[str, float]:
+    """Nightly MLOps loop: re-fit the flag threshold on the real-match corpus.
+
+    Trains on the committed archive (real ESPN fixtures only - never the
+    simulator), and refuses to move the threshold until enough real minutes
+    with both outcome classes have accumulated, so a single match or an idle
+    night can never dictate the production threshold.
+    """
+    corpus = archive.load_archive(archive_path=DB_PATH.parent / "match_archive.parquet")
     config = load_config(str(CONFIG_PATH))
+    current = float(config["hyperparameters"]["arbitrage_flag_threshold"])
+
+    def _skip(reason: str) -> dict[str, float]:
+        print(f"[optimize] skipped ({reason}); threshold unchanged at {current}.")
+        return {
+            "arbitrage_flag_threshold": current,
+            "log_loss": float("nan"),
+            "status": "skipped",
+            "evaluated_minutes": int(len(corpus)),
+        }
+
+    if corpus.empty or len(corpus) < min_minutes:
+        return _skip(f"{len(corpus)} archived real minutes < {min_minutes} required")
+    truth = derive_corpus_truth(corpus)
+    positives = float(truth.sum())
+    if positives == 0.0 or positives == float(len(truth)):
+        return _skip("corpus has only one outcome class so far")
+
+    result = grid_search_threshold(corpus["arbitrage_index"], truth)
     config["hyperparameters"]["arbitrage_flag_threshold"] = result[
         "arbitrage_flag_threshold"
     ]
@@ -293,13 +368,16 @@ def run_optimize() -> dict[str, float]:
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "log_loss": round(result["log_loss"], 6),
             "threshold": result["arbitrage_flag_threshold"],
-            "evaluated_minutes": int(len(state)),
+            "evaluated_minutes": int(len(corpus)),
+            "matches": int(corpus["match_id"].nunique()),
+            "source": "match_archive",
         }
     )
     save_config(str(CONFIG_PATH), config)
     print(
         f"[optimize] threshold={result['arbitrage_flag_threshold']} "
-        f"log_loss={result['log_loss']:.6f}"
+        f"log_loss={result['log_loss']:.6f} "
+        f"minutes={len(corpus)} matches={corpus['match_id'].nunique()}"
     )
     return result
 
@@ -313,10 +391,18 @@ def main() -> None:
         default="all",
         help="run = ingest streams, optimize = nightly self-correction",
     )
-    command = parser.parse_args().command
-    if command in ("run", "all"):
-        run_ingest()
-    if command in ("optimize", "all"):
+    parser.add_argument(
+        "--live-only",
+        action="store_true",
+        help=(
+            "skip the deterministic simulator: only write committed state when "
+            "a real (or feed) match is captured. Used by the live flywheel tick."
+        ),
+    )
+    args = parser.parse_args()
+    if args.command in ("run", "all"):
+        run_ingest(allow_simulator=not args.live_only)
+    if args.command in ("optimize", "all"):
         run_optimize()
 
 

@@ -17,6 +17,12 @@ import pandas as pd
 EMOTIONS: tuple[str, ...] = ("panic", "anger", "joy", "confidence", "despair", "surprise")
 EMOTION_COLUMNS: list[str] = [f"emo_{name}" for name in EMOTIONS]
 
+# The World Cup crowd is global: an English-only lexicon would systematically
+# under-read Spanish/Portuguese/French reactions and emoji-only posts, biasing
+# the panic score toward English speakers. Each emotion therefore carries
+# English terms, the highest-volume non-English football terms, and the emoji
+# that dominate live reaction streams. scored_share() exposes how much of a
+# window actually matched, so the remaining coverage gap stays visible.
 _EMOTION_LEXICON: dict[str, dict[str, float]] = {
     "panic": {
         "panic": 1.0,
@@ -38,6 +44,19 @@ _EMOTION_LEXICON: dict[str, dict[str, float]] = {
         "heart attack": 0.7,
         "here we go again": 0.6,
         "hold on": 0.4,
+        # es / pt / fr
+        "no puede ser": 0.8,
+        "nos van a remontar": 0.9,
+        "que nervios": 0.8,
+        "vamos a perder": 0.9,
+        "que medo": 0.8,
+        "vai dar ruim": 0.8,
+        "on va perdre": 0.9,
+        # emoji
+        "😰": 0.8,
+        "😨": 0.8,
+        "😱": 0.7,
+        "🥶": 0.6,
     },
     "anger": {
         "robbed": 0.9,
@@ -58,6 +77,19 @@ _EMOTION_LEXICON: dict[str, dict[str, float]] = {
         "corrupt": 0.9,
         "awful": 0.6,
         "ref is": 0.5,
+        # es / pt / fr
+        "robo": 0.9,
+        "ladrones": 0.9,
+        "verguenza": 0.9,
+        "vergüenza": 0.9,
+        "roubo": 0.9,
+        "vergonha": 0.9,
+        "arbitre": 0.5,
+        "scandale": 0.8,
+        # emoji
+        "🤬": 1.0,
+        "😡": 0.9,
+        "😠": 0.7,
     },
     "joy": {
         "what a goal": 1.0,
@@ -78,6 +110,21 @@ _EMOTION_LEXICON: dict[str, dict[str, float]] = {
         "masterclass": 0.8,
         "goal!!": 0.9,
         "what a save": 0.7,
+        # es / pt / fr
+        "golaco": 1.0,
+        "golaço": 1.0,
+        "que golazo": 1.0,
+        "golzao": 0.9,
+        "gooool": 0.9,
+        "que jogo": 0.6,
+        "magnifique": 0.8,
+        "quel but": 0.9,
+        # emoji
+        "⚽": 0.4,
+        "🔥": 0.5,
+        "🎉": 0.7,
+        "🥳": 0.7,
+        "🤩": 0.7,
     },
     "confidence": {
         "in control": 0.9,
@@ -94,6 +141,16 @@ _EMOTION_LEXICON: dict[str, dict[str, float]] = {
         "routine": 0.6,
         "professional": 0.5,
         "relax": 0.5,
+        # es / pt / fr
+        "tranquilo": 0.7,
+        "controlado": 0.8,
+        "tranquilo todo": 0.8,
+        "esta ganado": 0.7,
+        "facil": 0.5,
+        "tranquille": 0.7,
+        # emoji
+        "😎": 0.7,
+        "💪": 0.6,
     },
     "despair": {
         "it's over": 0.9,
@@ -110,6 +167,19 @@ _EMOTION_LEXICON: dict[str, dict[str, float]] = {
         "never win": 0.8,
         "we lost": 0.7,
         "pain": 0.5,
+        # es / pt / fr
+        "se acabo": 0.9,
+        "se acabó": 0.9,
+        "estamos eliminados": 1.0,
+        "acabou": 0.9,
+        "perdemos": 0.7,
+        "c'est fini": 0.9,
+        "elimines": 0.9,
+        # emoji
+        "😭": 0.9,
+        "😢": 0.7,
+        "💔": 0.9,
+        "😞": 0.6,
     },
     "surprise": {
         "no way": 0.8,
@@ -124,6 +194,17 @@ _EMOTION_LEXICON: dict[str, dict[str, float]] = {
         "didnt see that": 0.8,
         "plot twist": 0.7,
         "what just happened": 0.9,
+        # es / pt / fr
+        "no me lo creo": 0.8,
+        "increible": 0.7,
+        "increíble": 0.7,
+        "nao acredito": 0.8,
+        "inacreditavel": 0.8,
+        "incroyable": 0.7,
+        # emoji
+        "😲": 0.7,
+        "🤯": 0.8,
+        "😳": 0.6,
     },
 }
 
@@ -142,6 +223,20 @@ def classify_comments(messages: pd.Series) -> pd.DataFrame:
             raw += text.str.count(re.escape(term)).to_numpy(dtype=np.float64) * weight
         intensities[f"emo_{emotion}"] = raw
     return pd.DataFrame(intensities, index=messages.index)
+
+
+def scored_share(messages: pd.Series) -> float:
+    """Fraction of comments that matched at least one emotion term in [0, 1].
+
+    Makes lexicon coverage observable: a low value means most of the window
+    (e.g. non-supported languages or pure media) went unscored, so the panic
+    score rests on a small, possibly biased slice of the crowd.
+    """
+    if messages is None or len(messages) == 0:
+        return 0.0
+    intensities = classify_comments(messages)
+    matched = (intensities.sum(axis=1) > 0.0).mean()
+    return float(round(matched, 4))
 
 
 def emotion_shares(intensities: pd.DataFrame) -> pd.DataFrame:
