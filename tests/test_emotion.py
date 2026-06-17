@@ -13,6 +13,7 @@ from emotion import (
     emotional_volatility,
     generate_takeaways,
     minute_profile,
+    models_available,
     panic_from_profile,
     scored_share,
 )
@@ -137,9 +138,7 @@ def test_emotion_agent_empty_chat() -> None:
 
 
 def test_emotion_agent_uses_trained_model() -> None:
-    import emotion as emotion_mod
-
-    assert emotion_mod.models_available()  # shipped artifacts present
+    assert models_available()  # shipped artifacts present
     chat = pd.DataFrame(
         {
             "minute": [0, 1, 2],
@@ -160,9 +159,7 @@ def test_emotion_agent_uses_trained_model() -> None:
 
 
 def test_emotion_agent_lexicon_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    import emotion as emotion_mod
-
-    monkeypatch.setattr(emotion_mod, "models_available", lambda: False)
+    monkeypatch.setattr("emotion.models_available", lambda: False)
     chat = pd.DataFrame(
         {"minute": [0, 1, 5], "message": ["panic", "golazo", "we're done, can't watch"]}
     )
