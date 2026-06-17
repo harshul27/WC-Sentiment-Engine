@@ -14,6 +14,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+import textmodel
+
 EMOTIONS: tuple[str, ...] = ("panic", "anger", "joy", "confidence", "despair", "surprise")
 EMOTION_COLUMNS: list[str] = [f"emo_{name}" for name in EMOTIONS]
 
@@ -326,25 +328,127 @@ def panic_from_profile(profile: pd.DataFrame) -> pd.Series:
     )
 
 
+# --- trained-model scoring (primary) -------------------------------------
+# The lexicon above is retained as a transparent, dependency-free fallback and
+# as the source for the `confidence` emotion (no public dataset labels it). The
+# primary scorer is the offline-trained model in data/models/ (91% accuracy on
+# dair-ai/emotion vs 4% for the lexicon; multilingual panic direction from the
+# char-n-gram sentiment model). See data/benchmarks/emotion_benchmark.json.
+_MODEL_CACHE: dict[str, object | None] = {}
+
+
+def _load_model(name: str) -> object | None:
+    if name not in _MODEL_CACHE:
+        _MODEL_CACHE[name] = textmodel.try_load(name)
+    return _MODEL_CACHE[name]
+
+
+def models_available() -> bool:
+    """True when the trained emotion model artifacts are present."""
+    return _load_model("emotion_model") is not None
+
+
+def model_comment_scores(messages: pd.Series) -> tuple[pd.DataFrame, np.ndarray] | None:
+    """Per-comment emotion shares (6) + multilingual panic, via trained models.
+
+    Returns None when no trained model is available (callers fall back to the
+    lexicon). The emotion model supplies five classes; `confidence` is overlaid
+    from the lexicon, then rows are renormalised to proper shares. Panic
+    direction blends the emotion mass with the multilingual sentiment model so
+    non-English posts genuinely move the score.
+    """
+    emo_model = _load_model("emotion_model")
+    if emo_model is None:
+        return None
+    texts = messages.fillna("").astype(str).tolist()
+    proba = emo_model.predict_proba(texts)
+    columns = {f"emo_{cls}": proba[:, i] for i, cls in enumerate(emo_model.classes)}
+    columns["emo_confidence"] = (
+        classify_comments(messages)["emo_confidence"].to_numpy(dtype=np.float64)
+    )
+    frame = pd.DataFrame(columns, index=messages.index).reindex(
+        columns=EMOTION_COLUMNS, fill_value=0.0
+    )
+    totals = frame.sum(axis=1).replace(0.0, np.nan)
+    shares = frame.div(totals, axis=0).fillna(0.0)
+    negative = (
+        1.2 * shares["emo_panic"] + 1.1 * shares["emo_despair"] + 0.6 * shares["emo_anger"]
+    )
+    positive = 1.0 * shares["emo_confidence"] + 0.9 * shares["emo_joy"]
+    emotion_panic = (negative - positive).to_numpy(dtype=np.float64)
+    sent_model = _load_model("sentiment_model")
+    sentiment_panic = np.zeros(len(texts), dtype=np.float64)
+    if sent_model is not None:
+        sproba = sent_model.predict_proba(texts)
+        index = {cls: i for i, cls in enumerate(sent_model.classes)}
+        sentiment_panic = sproba[:, index["negative"]] - sproba[:, index["positive"]]
+    panic = np.tanh(emotion_panic + sentiment_panic)
+    return shares, panic
+
+
+def model_minute_profile(chat: pd.DataFrame) -> pd.DataFrame | None:
+    """Minute-indexed model emotion profile + per-minute panic (`_panic`)."""
+    scored = model_comment_scores(chat["message"])
+    if scored is None:
+        return None
+    shares, panic = scored
+    frame = chat[["minute"]].reset_index(drop=True).copy()
+    frame = pd.concat([frame, shares.reset_index(drop=True)], axis=1)
+    frame["_panic"] = panic
+    last_minute = int(frame["minute"].max())
+    grouped = frame.groupby("minute")[[*EMOTION_COLUMNS, "_panic"]].mean()
+    volume = frame.groupby("minute").size().rename("comment_volume")
+    profile = (
+        grouped.join(volume)
+        .reindex(range(last_minute + 1))
+        .ffill()
+        .fillna(0.0)
+        .reset_index(names="minute")
+    )
+    profile["comment_volume"] = profile["comment_volume"].astype("int64")
+    profile["minute"] = profile["minute"].astype("int64")
+    return profile
+
+
 @dataclass
 class EmotionAgent:
-    """Agent A v2: minute-indexed emotion profile + derived panic score."""
+    """Agent A v2: minute-indexed emotion profile + derived panic score.
+
+    Uses the trained model when its artifacts are present, otherwise the
+    interpretable lexicon - identical output schema either way.
+    """
 
     window_minutes: int = 5
 
+    def _empty(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "minute",
+                "crowd_panic_score",
+                *EMOTION_COLUMNS,
+                "dominant_emotion",
+                "emotional_volatility",
+                "comment_volume",
+            ]
+        ).astype({"minute": "int64", "crowd_panic_score": "float64"})
+
     def run(self, chat: pd.DataFrame) -> pd.DataFrame:
+        if chat.empty:
+            return self._empty()
+        model_profile = model_minute_profile(chat) if models_available() else None
+        if model_profile is not None:
+            panic = (
+                model_profile["_panic"]
+                .rolling(window=self.window_minutes, min_periods=1)
+                .mean()
+                .clip(-1.0, 1.0)
+            )
+            result = model_profile.drop(columns="_panic")
+            result.insert(1, "crowd_panic_score", panic)
+            result["dominant_emotion"] = dominant_emotion(result)
+            result["emotional_volatility"] = emotional_volatility(result)
+            return result
         profile = minute_profile(chat)
-        if profile.empty:
-            return pd.DataFrame(
-                columns=[
-                    "minute",
-                    "crowd_panic_score",
-                    *EMOTION_COLUMNS,
-                    "dominant_emotion",
-                    "emotional_volatility",
-                    "comment_volume",
-                ]
-            ).astype({"minute": "int64", "crowd_panic_score": "float64"})
         panic = (
             panic_from_profile(profile)
             .rolling(window=self.window_minutes, min_periods=1)

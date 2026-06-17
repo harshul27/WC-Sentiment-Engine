@@ -46,8 +46,10 @@ WC-sentiment-Engine/
 │   └── codeql.yml             # Weekly + PR CodeQL static security analysis
 ├── src/
 │   ├── model.py               # Vectorized sentiment math, agents, & arbitrage calculations
-│   ├── emotion.py             # Custom 6-emotion classifier, mood volatility, takeaway generator
+│   ├── emotion.py             # Emotion scoring: trained model primary (data/models) + lexicon fallback
+│   ├── textmodel.py           # Dependency-free (numpy) TF-IDF + linear scorer for the exported models
 │   ├── sources.py             # Multi-source reaction aggregator (Bluesky/Mastodon keyless; Reddit/YouTube/X key-gated), 200-comment window
+│   ├── odds.py                # The Odds API bookmaker consensus (key-gated, read-only) + market divergence
 │   ├── matchstats.py          # ESPN boxscore control index + optional ScraperFC/Sofascore momentum
 │   ├── live.py                # ESPN connectors, minute mapping, capture_phase start/stop lifecycle
 │   ├── archive.py             # NOT NULL match archive: match_archive + match_results (DuckDB + Parquet mirror)
@@ -56,9 +58,13 @@ WC-sentiment-Engine/
 │   ├── health.py              # Run heartbeat + LIVE/STALE/DEGRADED/NO-DATA freshness (run_status.json)
 │   ├── pipeline.py            # Live-first DuckDB ingestion, parsing, Parquet pipeline, corpus self-correction
 │   └── app.py                 # Streamlit frontend: live mode (60s auto-refresh), simulator, committed state
+├── scripts/
+│   └── train_emotion.py       # Offline trainer/CV/benchmark -> exports data/models/*.npz|json (needs requirements-train.txt)
 ├── tests/
-│   ├── conftest.py            # src path setup + offline/no-LLM-key isolation fixture
+│   ├── conftest.py            # src path setup + offline/no-key isolation fixture
 │   ├── test_model.py          # Unit tests: sentiment math, parsing, equation, grid search
+│   ├── test_textmodel.py      # Numpy scorer parity, shipped-model sanity, benchmark guard (>=0.80)
+│   ├── test_odds.py           # Odds de-vig, consensus, fixture market, divergence, key-gated skip
 │   ├── test_live.py           # Offline fixture tests for ESPN/Bluesky parsers & failure paths
 │   ├── test_pipeline.py       # Integration tests: DuckDB, Parquet, source selection, corpus self-correction
 │   ├── test_health.py         # Heartbeat + freshness-badge classification
@@ -67,9 +73,12 @@ WC-sentiment-Engine/
 │   ├── database.duckdb        # Local testing instance (Git-ignored)
 │   ├── model_config.json      # Dynamic hyperparameters & log-loss backpropagation history
 │   ├── run_status.json        # Engine heartbeat (source/freshness) for the dashboard badge
+│   ├── models/                # Committed trained-model artifacts (emotion_model, sentiment_model: npz+json)
+│   ├── benchmarks/            # emotion_benchmark.json: lexicon vs trained accuracy/F1/CV record
 │   └── state.parquet          # Compressed operational UI dataset source
 ├── requirements.txt           # Explicitly pinned runtime library weights (CVE-audited)
 ├── requirements-dev.txt       # Pinned test & security tooling (pytest/ruff/bandit/pip-audit)
+├── requirements-train.txt     # Offline training only (scikit-learn) - never runtime/CI
 └── CLAUDE.md                  # Context persistence engine (This File)
 ```
 
@@ -140,8 +149,15 @@ WC-sentiment-Engine/
 
 **Known follow-ups (require user action / deliberate non-goals):**
 - **Git binary bloat:** `*/20` Parquet commits during the tournament grow `main`'s history (binary blobs don't delta-compress). `--live-only` removed idle-commit churn; the full fix is an **orphan `data` branch** (or GH Releases) with Streamlit's `STATE_PARQUET_URL` repointed — deferred because it requires changing the deployed secret (avoided mid-tournament). 
-- Reboot Streamlit Cloud app (Python 3.13 + `STATE_PARQUET_URL` secret). Optional secrets: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`, `XAI_API_KEY`.
+- Reboot Streamlit Cloud app (Python 3.13 + `STATE_PARQUET_URL` secret). Optional secrets: `REDDIT_CLIENT_ID`/`REDDIT_CLIENT_SECRET`, `YOUTUBE_API_KEY`, `XAI_API_KEY`, `ODDS_API_KEY`.
 - Consider learning situation prototypes from the archive once more matchdays accumulate.
+- **Longitudinal mispricing:** persist per-minute market-implied probabilities alongside crowd panic so divergence can be *measured over time* (does crowd panic lead/lag market repricing?), upgrading the odds reference from a snapshot to a validated signal.
+- Optional accuracy lift: a multilingual word+char union or distilled model could push sentiment past ~52%, but only a transformer would approach 80% (breaks the free/lightweight constraint).
 
 **Completed (2026-06-16, X / Grok source):**
 36. `src/sources.py` `fetch_x` — recent X posts via the user's own xAI/Grok key, using the **X Search agent tool** (`POST https://api.x.ai/v1/responses`, model `grok-4.3`, `tools:[{"type":"x_search"}]`; the deprecated `search_parameters` Live Search was retired 2026-01-12). Grok is asked to return found posts as a JSON array; `_extract_response_text`/`_parse_post_json` tolerantly parse the `/responses` payload (both `output_text` and `output[]` message shapes), mapping to the unified `(created_utc, message, source="x")` schema with a now() timestamp fallback. Key-gated on `XAI_API_KEY` (overridable model via `XAI_MODEL`), broad-except → empty like every other connector, wired into `gather_reactions`. Tests: parse path, missing-timestamp fallback, malformed-JSON resilience, key-gated skip. Suite: **104 tests**. NOTE: X has no free public firehose — this bills against the user's personal xAI account, so it stays opt-in.
+
+**Completed (2026-06-17, model accuracy + market reference):**
+37. **Emotion model trained & validated against real data.** `scripts/train_emotion.py` (run offline, `requirements-train.txt`) measured the OLD lexicon at **4.3% accuracy** on `dair-ai/emotion` (held-out 2k test) — far below the 80% bar — and trained a lightweight TF-IDF + logistic-regression replacement: **91.2% test accuracy, macro-F1 0.86, stratified 5-fold CV 91.1%±0.5%**. Models are exported to `data/models/*.npz|json` and scored at runtime by `src/textmodel.py` in **pure numpy** (shared analyzers guarantee numpy↔sklearn parity to 4e-16) — **no new runtime dependency**, free deploy preserved. `emotion.py` now uses the trained model as the primary scorer with the lexicon retained as a transparent fallback and as the source for the `confidence` emotion (no public dataset labels it). Full benchmark in `data/benchmarks/emotion_benchmark.json`; a test guards `test_accuracy >= 0.80`.
+38. **Multilingual panic coverage.** A char-n-gram sentiment model trained on `cardiffnlp/tweet_sentiment_multilingual` (8 languages: en/es/pt/fr/it/de/hi/ar) drives the crowd-panic *direction*, blended with the emotion model. Lexicon multilingual sentiment was ~33% (chance); the trained model is ~52% across 8 languages (a hard 3-class tweet task — lightweight ML ceiling; 80% there needs a transformer, deliberately avoided). This genuinely moves the panic score for non-English posts, closing the "partial crowd signal" gap; honest per-language numbers are recorded in the benchmark.
+39. **Market reference (odds).** `src/odds.py` — key-gated (`ODDS_API_KEY`) read-only **The Odds API** consensus: de-vigs bookmaker decimal odds into implied home/draw/away probabilities, derives a market `certainty`, and computes a `sentiment_market_divergence` (|crowd panic| × certainty). Dashboard shows a "Market vs Crowd" panel in live mode when a key is present. Strictly read-only — never wagers, not betting advice. Closes the "no market to compare against" gap with a real consensus reference. **Honest limit:** our crowd signal is aggregate (not team-aligned) and this is a single-snapshot divergence; true longitudinal mispricing measurement (storing market probs per minute and correlating with panic) is the documented next step. Suite: **118 tests**, ruff + bandit clean.
