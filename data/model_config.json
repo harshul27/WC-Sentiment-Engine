@@ -6,7 +6,7 @@
       1.0
     ],
     "xg_rolling_window_minutes": 10,
-    "arbitrage_flag_threshold": 0.5
+    "arbitrage_flag_threshold": 0.6
   },
   "log_loss_history": [
     {
@@ -62,6 +62,14 @@
       "log_loss": 0.083276,
       "threshold": 0.5,
       "evaluated_minutes": 131
+    },
+    {
+      "timestamp": "2026-06-17T03:49:49+00:00",
+      "log_loss": 0.215387,
+      "threshold": 0.6,
+      "evaluated_minutes": 2045,
+      "matches": 18,
+      "source": "match_archive"
     }
   ]
 }
