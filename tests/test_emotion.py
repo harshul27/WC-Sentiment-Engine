@@ -13,6 +13,7 @@ from emotion import (
     emotional_volatility,
     generate_takeaways,
     minute_profile,
+    models_available,
     panic_from_profile,
     scored_share,
 )
@@ -134,6 +135,38 @@ def test_emotion_agent_output_schema() -> None:
 def test_emotion_agent_empty_chat() -> None:
     result = EmotionAgent().run(pd.DataFrame(columns=["minute", "message"]))
     assert result.empty
+
+
+def test_emotion_agent_uses_trained_model() -> None:
+    assert models_available()  # shipped artifacts present
+    chat = pd.DataFrame(
+        {
+            "minute": [0, 1, 2],
+            "message": [
+                "i feel so scared and terrified, total panic",
+                "this is hopeless, i am devastated and gutted",
+                "what a goal, i feel amazing and so happy",
+            ],
+        }
+    )
+    result = EmotionAgent(window_minutes=1).run(chat)
+    assert list(result["minute"]) == [0, 1, 2]
+    assert result["crowd_panic_score"].between(-1.0, 1.0).all()
+    # negative-emotion minutes should read more panicked than the joyful one
+    assert float(result.loc[0, "crowd_panic_score"]) > float(result.loc[2, "crowd_panic_score"])
+    for column in EMOTION_COLUMNS:
+        assert column in result.columns
+
+
+def test_emotion_agent_lexicon_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("emotion.models_available", lambda: False)
+    chat = pd.DataFrame(
+        {"minute": [0, 1, 5], "message": ["panic", "golazo", "we're done, can't watch"]}
+    )
+    result = EmotionAgent(window_minutes=3).run(chat)
+    assert list(result["minute"]) == list(range(6))
+    assert result["crowd_panic_score"].between(-1.0, 1.0).all()
+    assert "dominant_emotion" in result.columns
 
 
 def _state_row(**overrides: object) -> pd.DataFrame:

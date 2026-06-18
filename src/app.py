@@ -22,6 +22,7 @@ import streamlit as st
 sys.path.append(str(Path(__file__).resolve().parent))
 
 import health
+import odds
 from advanced import fixture_prior
 from archive import load_archive
 from emotion import EMOTION_COLUMNS, EmotionAgent, generate_takeaways, scored_share
@@ -190,6 +191,39 @@ def render_situation(frame: pd.DataFrame, priors_note: str = "") -> None:
     ):
         slot.metric(label, f"{value:+.2f}" if column == "crowd_panic_score" else f"{value:.2f}")
     st.caption(str(brief["read"]) + (f" {priors_note}" if priors_note else ""))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_market(home_team: str, away_team: str) -> dict | None:
+    """De-vigged bookmaker market for the fixture (cached; key-gated)."""
+    if not odds.odds_enabled():
+        return None
+    return odds.fixture_market(home_team, away_team)
+
+
+def render_market(market: dict, latest_panic: float) -> None:
+    """Real market consensus next to the crowd signal (read-only odds)."""
+    st.subheader("📊 Market vs Crowd")
+    cols = st.columns(4)
+    for slot, key, label in (
+        (cols[0], "home_prob", "Home win"),
+        (cols[1], "draw_prob", "Draw"),
+        (cols[2], "away_prob", "Away win"),
+    ):
+        value = market.get(key)
+        slot.metric(label, "—" if value is None else f"{value:.0%}")
+    divergence = odds.sentiment_market_divergence(latest_panic, market["certainty"])
+    cols[3].metric(
+        "Sentiment↔Market divergence",
+        f"{divergence:.2f}",
+        help="|crowd panic| × market certainty — high when the crowd is agitated "
+        "but the market still prices a settled outcome.",
+    )
+    st.caption(
+        f"Market-implied favorite: {market['favorite']} "
+        f"({market['certainty']:.0%} certainty). Read-only bookmaker consensus — "
+        "not betting advice."
+    )
 
 
 def render_takeaways(frame: pd.DataFrame, match_stats: dict | None = None) -> None:
@@ -362,6 +396,9 @@ def live_panel(event_id: str) -> None:
         )
         st.session_state[f"final_snapshot_{event_id}"] = (state, chat, match_stats)
     render_full_panel(state, chat, match_stats, priors_note_for(match))
+    market = load_market(str(match.get("home_team", "")), str(match.get("away_team", "")))
+    if market:
+        render_market(market, float(state.iloc[-1]["crowd_panic_score"]))
     st.caption(f"Live mode - last refresh {utc_now():%H:%M:%S UTC}, next in ~60s.")
 
 
