@@ -13,6 +13,7 @@ from emotion import (
     emotional_volatility,
     generate_takeaways,
     minute_profile,
+    model_comment_scores,
     models_available,
     panic_from_profile,
     scored_share,
@@ -139,6 +140,25 @@ def test_emotion_agent_empty_chat() -> None:
 
 def test_emotion_agent_uses_trained_model() -> None:
     assert models_available()  # shipped artifacts present
+
+
+def test_hybrid_corrects_football_phrasing() -> None:
+    """The general-domain model alone mislabels football phrasing (e.g. 'we are
+    done' as joy); the lexicon-anchored hybrid must classify these correctly so
+    the per-team moods shown in the dashboard are defensible."""
+    if not models_available():
+        return  # hybrid only applies when the trained model is shipped
+    cases = {
+        "Mexico are choking, we are done": "panic",
+        "this defense is a disgrace, robbery": "anger",
+        "golazo! what a goal, screamer": "joy",
+        "totally cruising, comfortable and in control": "confidence",
+        "se acabó, estamos eliminados 😭": "despair",
+    }
+    shares, _ = model_comment_scores(pd.Series(list(cases)))
+    dominant = shares.idxmax(axis=1).str.removeprefix("emo_").tolist()
+    for got, (text, expected) in zip(dominant, cases.items()):
+        assert got == expected, f"{text!r} -> {got}, expected {expected}"
     chat = pd.DataFrame(
         {
             "minute": [0, 1, 2],

@@ -45,6 +45,15 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           COMMENTARY_FEED_URL: ${{ vars.COMMENTARY_FEED_URL }}
+          # Optional crowd/odds sources and the Supabase mirror. Each is
+          # key-gated and best-effort: absent secrets are simply skipped.
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
 
       - name: Nightly self-correction (threshold grid search)
         if: github.event.schedule == '0 0 * * *' || github.event_name == 'workflow_dispatch'

@@ -30,6 +30,7 @@ import archive
 import health
 import live
 import situation
+import warehouse
 from emotion import EMOTION_COLUMNS, EmotionAgent
 from model import (
     ArbitrageSelector,
@@ -275,6 +276,9 @@ def run_ingest(allow_simulator: bool = True) -> pd.DataFrame:
     health.write_status(
         health.stream_health(chat, commentary, match_id), STATUS_PATH
     )
+    if warehouse.enabled():
+        synced = warehouse.sync_from_disk(STATE_PATH.parent)
+        print(f"[run] mirrored to supabase: {synced}")
     print(
         f"[run] match_id={match_id} rows={len(state)} "
         f"flagged_minutes={flagged} archived_rows={archived}"

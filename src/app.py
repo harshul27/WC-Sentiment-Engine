@@ -21,13 +21,21 @@ import streamlit as st
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
+import glossary
 import health
 import odds
 from advanced import fixture_prior
 from archive import load_archive
-from emotion import EMOTION_COLUMNS, EmotionAgent, generate_takeaways, scored_share
+from emotion import (
+    EMOTION_COLUMNS,
+    EmotionAgent,
+    generate_takeaways,
+    headline_outcome,
+    scored_share,
+    team_emotion_summary,
+)
 from live import POST_GRACE, capture_phase, fetch_scoreboard, live_streams, utc_now
-from matchstats import control_index, fetch_boxscore
+from matchstats import KEY_STATS, control_index, fetch_boxscore, fetch_sofascore_momentum
 from model import ArbitrageSelector, MatchProgressionAgent, load_config
 from pipeline import fill_emotion_columns, simulate_streams
 from situation import classify, metrics_that_matter, situation_brief
@@ -36,12 +44,23 @@ ROOT = Path(__file__).resolve().parents[1]
 STATE_PATH = ROOT / "data" / "state.parquet"
 STATUS_PATH = ROOT / "data" / "run_status.json"
 CONFIG_PATH = ROOT / "data" / "model_config.json"
+BENCHMARK_PATH = ROOT / "data" / "benchmarks" / "emotion_benchmark.json"
 CHART_COLUMNS = ["crowd_panic_score", "delta_xg_10min", "arbitrage_index"]
+CHART_LABELS = {col: glossary.label(col) for col in CHART_COLUMNS}
 MODE_LIVE = "🔴 Live match"
 MODE_SIM = "🎮 Simulator"
 MODE_STATE = "📦 Committed state"
 EMOTION_LABELS = {col: col.removeprefix("emo_").title() for col in EMOTION_COLUMNS}
 TONE_RENDERERS = {"warning": st.warning, "positive": st.success, "info": st.info}
+# Friendly stat labels for the per-team live match-stats panel.
+STAT_LABELS = {
+    "possessionPct": "Possession %",
+    "totalShots": "Shots",
+    "shotsOnTarget": "On Target",
+    "wonCorners": "Corners",
+    "saves": "Saves",
+    "foulsCommitted": "Fouls",
+}
 
 
 @st.cache_data(ttl=300)
@@ -127,30 +146,41 @@ def render_metrics(frame: pd.DataFrame, container) -> None:
     previous = frame.iloc[-2] if len(frame) > 1 else latest
     cols = container.columns(5)
     cols[0].metric(
-        "Crowd Panic Score",
+        glossary.label("crowd_panic_score"),
         f"{latest['crowd_panic_score']:+.2f}",
         delta=f"{latest['crowd_panic_score'] - previous['crowd_panic_score']:+.2f}",
         delta_color="inverse",
+        help=glossary.tooltip("crowd_panic_score"),
     )
     cols[1].metric(
-        "xG Stability (10 min)",
+        glossary.label("delta_xg_10min"),
         f"{latest['delta_xg_10min']:.2f}",
         delta=f"{latest['delta_xg_10min'] - previous['delta_xg_10min']:+.2f}",
+        help=glossary.tooltip("delta_xg_10min"),
     )
     cols[2].metric(
-        "Arbitrage Index",
+        glossary.label("arbitrage_index"),
         f"{latest['arbitrage_index']:.2f}",
         delta=f"{latest['arbitrage_index'] - previous['arbitrage_index']:+.2f}",
         delta_color="inverse",
+        help=glossary.tooltip("arbitrage_index"),
     )
     if "dominant_emotion" in frame.columns:
-        cols[3].metric("Crowd Mood", str(latest.get("dominant_emotion", "neutral")).title())
-    cols[4].metric("Flagged Minutes", int(frame["flagged"].sum()))
+        cols[3].metric(
+            "Loudest Emotion",
+            str(latest.get("dominant_emotion", "neutral")).title(),
+            help="The single emotion the most fans are expressing right now.",
+        )
+    cols[4].metric(
+        glossary.label("flagged"),
+        int(frame["flagged"].sum()),
+        help=glossary.tooltip("flagged"),
+    )
 
 
 def render_chart(frame: pd.DataFrame, container) -> None:
     container.line_chart(
-        frame.set_index("minute")[CHART_COLUMNS],
+        frame.set_index("minute")[CHART_COLUMNS].rename(columns=CHART_LABELS),
         height=340,
         use_container_width=True,
     )
@@ -182,9 +212,13 @@ def render_situation(frame: pd.DataFrame, priors_note: str = "") -> None:
         return
     latest = frame.iloc[-1]
     brief = situation_brief(str(latest["situation"]))
-    st.subheader("🧭 Match Situation (live classification)")
+    st.subheader("🧭 Match Read (live)")
     cols = st.columns(2 + len(brief["metrics"]))
-    cols[0].metric("Situation", str(brief["label"]))
+    cols[0].metric(
+        "Match Read",
+        str(brief["label"]),
+        help="The model's plain read of the moment, classified every minute.",
+    )
     cols[1].metric("Confidence", f"{float(latest['situation_confidence']):.0%}")
     for slot, (column, label, value) in zip(
         cols[2:], metrics_that_matter(frame)
@@ -203,7 +237,7 @@ def load_market(home_team: str, away_team: str) -> dict | None:
 
 def render_market(market: dict, latest_panic: float) -> None:
     """Real market consensus next to the crowd signal (read-only odds)."""
-    st.subheader("📊 Market vs Crowd")
+    st.subheader("📊 Bookmakers vs Crowd")
     cols = st.columns(4)
     for slot, key, label in (
         (cols[0], "home_prob", "Home win"),
@@ -214,10 +248,9 @@ def render_market(market: dict, latest_panic: float) -> None:
         slot.metric(label, "—" if value is None else f"{value:.0%}")
     divergence = odds.sentiment_market_divergence(latest_panic, market["certainty"])
     cols[3].metric(
-        "Sentiment↔Market divergence",
+        glossary.label("sentiment_market_divergence"),
         f"{divergence:.2f}",
-        help="|crowd panic| × market certainty — high when the crowd is agitated "
-        "but the market still prices a settled outcome.",
+        help=glossary.tooltip("sentiment_market_divergence"),
     )
     st.caption(
         f"Market-implied favorite: {market['favorite']} "
@@ -235,9 +268,13 @@ def render_takeaways(frame: pd.DataFrame, match_stats: dict | None = None) -> No
 
 def render_flags(frame: pd.DataFrame) -> None:
     flagged = frame.loc[frame["flagged"]].sort_values("arbitrage_index", ascending=False)
-    st.subheader("🚩 Flagged Market Panic Moments")
+    st.subheader("🚩 Overreaction Moments")
+    st.caption(
+        "Minutes where fans spiked but the match itself stayed calm — the "
+        "widest Hype-vs-Reality gaps."
+    )
     if flagged.empty:
-        st.info("No arbitrage events flagged in the current state window.")
+        st.info("No overreaction moments in the current window.")
         return
     badge_cols = st.columns(min(4, len(flagged)))
     for slot, (_, row) in zip(badge_cols, flagged.iterrows()):
@@ -276,22 +313,166 @@ def render_reactions(chat: pd.DataFrame) -> None:
         st.dataframe(chat.tail(30), use_container_width=True, hide_index=True)
 
 
+def render_headline(
+    state: pd.DataFrame, team_summary: dict | None = None
+) -> None:
+    """The single plain-language 'what's happening right now' sentence."""
+    sentence = headline_outcome(state, active_threshold(), team_summary)
+    st.subheader("📣 Right Now")
+    st.info(sentence)
+
+
+def render_team_moods(team_summary: dict) -> None:
+    """Per-team crowd mood so a single emotion is never ambiguous."""
+    if not team_summary:
+        return
+    st.subheader("👥 Mood by Team")
+    sides = [s for s in ("home", "away") if s in team_summary]
+    cols = st.columns(len(sides))
+    icons = {"home": "🏠", "away": "🛫"}
+    for slot, side in zip(cols, sides):
+        info = team_summary[side]
+        volume = int(info.get("volume", 0))
+        slot.metric(
+            f"{icons[side]} {info.get('team', side)} fans",
+            str(info.get("dominant", "neutral")).title(),
+            help=f"Loudest emotion among {volume} reactions mentioning this team "
+            f"(reading coverage {float(info.get('coverage', 0.0)):.0%}).",
+        )
+        slot.caption(f"{volume} reactions")
+    # crude overall denominator for a coverage line
+    st.caption(
+        "Each reaction is tagged by the team it names; posts mentioning both "
+        "count for both sides. Reactions naming neither team are not shown here."
+    )
+
+
+def render_match_stats(match_stats: dict, momentum: pd.DataFrame | None = None) -> None:
+    """Clear per-team live match statistics beside the crowd mood."""
+    if not match_stats:
+        st.caption("Live match statistics not available from the feed yet.")
+        return
+    st.subheader("📈 Live Match Stats")
+    teams_order = list(match_stats.keys())
+    table = {
+        STAT_LABELS[key]: [match_stats[t].get(key, "—") for t in teams_order]
+        for key in KEY_STATS
+        if key in STAT_LABELS
+    }
+    frame = pd.DataFrame(table, index=teams_order).T
+    st.dataframe(frame, use_container_width=True)
+    control = control_index(match_stats)
+    if control is not None and teams_order:
+        st.caption(
+            f"Match Control: {teams_order[0]} holds {control:.0%} of the contest "
+            "(possession + shots blend)."
+        )
+    if momentum is not None and not momentum.empty:
+        st.caption("Attack momentum (Sofascore) — above 0 favours the home side:")
+        st.area_chart(
+            momentum.set_index("minute")["momentum"], height=160,
+            use_container_width=True,
+        )
+    else:
+        st.caption(
+            "Deeper xG/attack-momentum runs in local mode only — Sofascore "
+            "blocks cloud server IPs, so the public app shows the ESPN stats above."
+        )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_benchmark() -> dict | None:
+    import json
+
+    if not BENCHMARK_PATH.exists():
+        return None
+    try:
+        return json.loads(BENCHMARK_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def render_validation(live_coverage: float | None = None) -> None:
+    """Surface the emotion model's real validation so categorisation is trusted."""
+    bench = load_benchmark()
+    with st.expander("✅ How accurate is the emotion model?"):
+        if not bench:
+            st.caption("Validation record not available.")
+            return
+        trained = bench.get("trained_emotion", {})
+        lexicon = bench.get("lexicon", {})
+        acc = float(trained.get("test_accuracy", 0.0))
+        cv_mean = float(trained.get("cv_accuracy_mean", 0.0))
+        cv_std = float(trained.get("cv_accuracy_std", 0.0))
+        st.markdown(
+            f"**The model agrees with human-labelled data {acc:.0%} of the time** "
+            f"on a held-out test set, and {cv_mean:.0%} (±{cv_std:.0%}) across "
+            f"5-fold cross-validation — versus only "
+            f"{float(lexicon.get('emotion_accuracy', 0.0)):.0%} for a plain "
+            "keyword approach."
+        )
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "Trained model": [
+                        f"{acc:.1%}",
+                        f"{float(trained.get('test_macro_f1', 0.0)):.1%}",
+                        f"{cv_mean:.1%} ± {cv_std:.1%}",
+                    ],
+                    "Keyword baseline": [
+                        f"{float(lexicon.get('emotion_accuracy', 0.0)):.1%}",
+                        f"{float(lexicon.get('emotion_macro_f1', 0.0)):.1%}",
+                        "—",
+                    ],
+                },
+                index=["Test accuracy", "Macro F1", "Cross-validation"],
+            ),
+            use_container_width=True,
+        )
+        langs = bench.get("trained_sentiment", {}).get("per_language_accuracy", {})
+        if langs:
+            st.caption(
+                "Multilingual sentiment accuracy by language: "
+                + ", ".join(f"{k} {float(v):.0%}" for k, v in langs.items())
+            )
+        datasets = bench.get("datasets", {})
+        st.caption(
+            "Trained & tested on public datasets: "
+            + ", ".join(f"{k} ({v})" for k, v in datasets.items())
+            + ". Exported to pure-numpy with parity to scikit-learn."
+        )
+        st.caption(
+            "For football-specific phrasing (e.g. 'we are done', 'disgrace'), the "
+            "model is anchored by a curated football+emoji lexicon so the live "
+            "categorisation stays accurate on this domain, not just the benchmark."
+        )
+        if live_coverage is not None:
+            st.caption(
+                f"On the current live window the model could read "
+                f"{live_coverage:.0%} of captured posts ({glossary.label('scored_share')})."
+            )
+
+
 def render_full_panel(
     state: pd.DataFrame,
     chat: pd.DataFrame,
     match_stats: dict,
     priors_note: str = "",
+    team_summary: dict | None = None,
+    momentum: pd.DataFrame | None = None,
 ) -> None:
-    control = control_index(match_stats)
+    render_headline(state, team_summary)
     render_metrics(state, st.container())
+    if team_summary:
+        render_team_moods(team_summary)
     render_chart(state, st.empty())
     render_situation(state, priors_note)
+    render_match_stats(match_stats, momentum)
     render_takeaways(state, match_stats)
-    if control is not None and match_stats:
-        first_team = next(iter(match_stats))
-        st.caption(f"Match control index: {first_team} {control:.0%} of the contest.")
     render_emotions(state, st.container())
     render_flags(state)
+    live_coverage = scored_share(chat["message"]) if "message" in chat.columns else None
+    render_validation(live_coverage)
     render_reactions(chat)
 
 
@@ -387,6 +568,10 @@ def live_panel(event_id: str) -> None:
         st.info("Streams connected; not enough data to score yet.")
         return
     match_stats = fetch_boxscore(event_id)
+    home_team = str(match.get("home_team") or "")
+    away_team = str(match.get("away_team") or "")
+    team_summary = team_emotion_summary(chat, home_team, away_team)
+    momentum = fetch_sofascore_momentum(home_team, away_team)
     if phase == "post-window":
         first_seen = post_seen.get(event_id, utc_now())
         remaining = max(0, int((POST_GRACE - (utc_now() - first_seen)).total_seconds() // 60))
@@ -395,7 +580,9 @@ def live_panel(event_id: str) -> None:
             f"stops in ~{remaining} min."
         )
         st.session_state[f"final_snapshot_{event_id}"] = (state, chat, match_stats)
-    render_full_panel(state, chat, match_stats, priors_note_for(match))
+    render_full_panel(
+        state, chat, match_stats, priors_note_for(match), team_summary, momentum
+    )
     market = load_market(str(match.get("home_team", "")), str(match.get("away_team", "")))
     if market:
         render_market(market, float(state.iloc[-1]["crowd_panic_score"]))
@@ -434,12 +621,14 @@ def render_simulator_mode(seed: int, speed: float) -> None:
         progress.empty()
         st.session_state["sim_state"] = state
     state = st.session_state.get("sim_state", build_simulation(seed))
+    render_headline(state)
     render_metrics(state, metrics_slot.container())
     render_chart(state, chart_slot)
     render_situation(state)
     render_takeaways(state)
     render_emotions(state, st.container())
     render_flags(state)
+    render_validation()
 
 
 def render_state_mode() -> None:
@@ -453,26 +642,28 @@ def render_state_mode() -> None:
         return
     if "match_id" in state.columns and len(state):
         st.caption(f"Source run: {state['match_id'].iloc[-1]}")
+    render_headline(state)
     render_metrics(state, st.container())
     render_chart(state, st.empty())
     render_situation(state)
     render_takeaways(state)
     render_emotions(state, st.container())
     render_flags(state)
+    render_validation()
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="WC Sentiment Arbitrage Engine", page_icon="⚽", layout="wide"
+        page_title="World Cup Crowd Mood Engine", page_icon="⚽", layout="wide"
     )
-    st.title("⚽ WC Sentiment Arbitrage Engine")
+    st.title(glossary.TITLE)
+    st.caption(glossary.SUBTITLE)
+    with st.expander("❓ What am I looking at?"):
+        for heading, body in glossary.GUIDE:
+            st.markdown(f"**{heading}** — {body}")
     st.caption(
-        "Wisdom-of-crowds divergence tracker: crowd emotions vs. real match "
-        "stability, flagged when sentiment decouples from the pitch."
-    )
-    st.caption(
-        "ℹ️ The Arbitrage Index measures **sentiment–pitch divergence** as a "
-        "proxy for potential market overreaction. It is not connected to any "
+        "ℹ️ The Hype-vs-Reality Gap measures **crowd mood vs. real match "
+        "action** as a proxy for fan overreaction. It is not connected to any "
         "live betting market and is not financial or betting advice."
     )
 
