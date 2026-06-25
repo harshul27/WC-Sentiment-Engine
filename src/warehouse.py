@@ -72,7 +72,9 @@ def _clean(value: object) -> object:
         if pd.isna(value):
             return None
     except (TypeError, ValueError):
-        pass
+        # pd.isna raises on non-scalar values (lists/dicts); those are already
+        # JSON-safe, so fall through and return them unchanged.
+        return value
     return value
 
 
@@ -140,7 +142,9 @@ def sync_from_disk(data_dir: Path = DATA_DIR) -> dict[str, int]:
                 json.loads(status_path.read_text(encoding="utf-8"))
             )
         except (OSError, ValueError):
-            pass
+            # Best-effort mirror: an unreadable/malformed heartbeat must never
+            # break the sync of the other tables.
+            counts["run_status"] = 0
     return counts
 
 
