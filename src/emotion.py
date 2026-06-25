@@ -348,29 +348,50 @@ def models_available() -> bool:
     return _load_model("emotion_model") is not None
 
 
+# How strongly the football lexicon overrides the general-domain model when it
+# fires. The trained model is excellent on the public benchmark but was trained
+# on general tweets, so football phrasing ("we are done", "disgrace") can be
+# mislabelled (often as joy). The curated lexicon is high-precision on exactly
+# that phrasing, so where it fires we trust it; where it is silent (e.g. plain
+# non-English posts) the model carries the load. _LEX_HALF sets the lexicon
+# intensity at which the blend reaches half its cap; _LEX_MAX caps its weight.
+_LEX_HALF = 0.6
+_LEX_MAX = 0.7
+
+
 def model_comment_scores(messages: pd.Series) -> tuple[pd.DataFrame, np.ndarray] | None:
-    """Per-comment emotion shares (6) + multilingual panic, via trained models.
+    """Per-comment emotion shares (6) + multilingual panic, hybrid scored.
 
     Returns None when no trained model is available (callers fall back to the
-    lexicon). The emotion model supplies five classes; `confidence` is overlaid
-    from the lexicon, then rows are renormalised to proper shares. Panic
-    direction blends the emotion mass with the multilingual sentiment model so
-    non-English posts genuinely move the score.
+    lexicon). Each comment's distribution blends the trained model (recall +
+    multilingual reach) with the football lexicon (precision on football
+    phrasing), weighting the lexicon by how strongly it fired. Panic direction
+    additionally folds in the multilingual sentiment model so non-English posts
+    genuinely move the score.
     """
     emo_model = _load_model("emotion_model")
     if emo_model is None:
         return None
     texts = messages.fillna("").astype(str).tolist()
     proba = emo_model.predict_proba(texts)
-    columns = {f"emo_{cls}": proba[:, i] for i, cls in enumerate(emo_model.classes)}
-    columns["emo_confidence"] = (
-        classify_comments(messages)["emo_confidence"].to_numpy(dtype=np.float64)
+    model_frame = pd.DataFrame(
+        {f"emo_{cls}": proba[:, i] for i, cls in enumerate(emo_model.classes)},
+        index=messages.index,
+    ).reindex(columns=EMOTION_COLUMNS, fill_value=0.0)
+
+    lex_intensity = classify_comments(messages)
+    lex_shares = emotion_shares(lex_intensity)  # 6-col, all-zero when silent
+    lex_strength = lex_intensity.sum(axis=1).to_numpy(dtype=np.float64)
+    weight = np.minimum(_LEX_MAX, lex_strength / (lex_strength + _LEX_HALF))
+    weight = np.where(lex_strength > 0.0, weight, 0.0)[:, None]
+
+    blended = (1.0 - weight) * model_frame.to_numpy(dtype=np.float64) + (
+        weight * lex_shares.to_numpy(dtype=np.float64)
     )
-    frame = pd.DataFrame(columns, index=messages.index).reindex(
-        columns=EMOTION_COLUMNS, fill_value=0.0
-    )
+    frame = pd.DataFrame(blended, index=messages.index, columns=EMOTION_COLUMNS)
     totals = frame.sum(axis=1).replace(0.0, np.nan)
     shares = frame.div(totals, axis=0).fillna(0.0)
+
     negative = (
         1.2 * shares["emo_panic"] + 1.1 * shares["emo_despair"] + 0.6 * shares["emo_anger"]
     )
@@ -555,3 +576,98 @@ def generate_takeaways(
             }
         )
     return takeaways
+
+
+def _profile_summary(messages: pd.Series) -> dict[str, object]:
+    """Dominant emotion, mean shares, and reading coverage for a message set."""
+    empty = {
+        "dominant": "neutral",
+        "shares": {col: 0.0 for col in EMOTION_COLUMNS},
+        "volume": 0,
+        "coverage": 0.0,
+    }
+    if messages is None or len(messages) == 0:
+        return empty
+    scored = model_comment_scores(messages) if models_available() else None
+    if scored is not None:
+        shares = scored[0]
+    else:
+        shares = emotion_shares(classify_comments(messages))
+    mean_shares = shares.mean(axis=0)
+    top = mean_shares.idxmax()
+    dominant = (
+        str(top).removeprefix("emo_") if float(mean_shares.max()) > 0.0 else "neutral"
+    )
+    return {
+        "dominant": dominant,
+        "shares": {col: float(round(mean_shares.get(col, 0.0), 4)) for col in EMOTION_COLUMNS},
+        "volume": int(len(messages)),
+        "coverage": scored_share(messages),
+    }
+
+
+def team_emotion_summary(
+    chat: pd.DataFrame, home_team: str, away_team: str
+) -> dict[str, dict[str, object]]:
+    """Per-team mood: {'home'|'away': {team, dominant, shares, volume, coverage}}.
+
+    Expects a `team` column (home|away|both|neither) as produced by
+    teams.tag_reactions; `both`-tagged posts count for each side. Returns an
+    empty dict when the chat has no team tags (e.g. simulator/committed modes).
+    """
+    if chat.empty or "team" not in chat.columns:
+        return {}
+    summary: dict[str, dict[str, object]] = {}
+    for side, name in (("home", home_team), ("away", away_team)):
+        subset = chat.loc[chat["team"].isin([side, "both"]), "message"]
+        entry = _profile_summary(subset)
+        entry["team"] = str(name or side)
+        summary[side] = entry
+    return summary
+
+
+def headline_outcome(
+    state: pd.DataFrame,
+    threshold: float,
+    team_summary: dict[str, dict[str, object]] | None = None,
+) -> str:
+    """One plain-language sentence describing the moment for a lay audience."""
+    if state is None or state.empty:
+        return "Waiting for enough fan reactions to read the crowd."
+    latest = state.iloc[-1]
+    panic = float(latest.get("crowd_panic_score", 0.0))
+    stability = float(latest.get("delta_xg_10min", 0.0))
+    gap = float(latest.get("arbitrage_index", 0.0))
+    mood = "anxious" if panic > 0.25 else "calm and confident" if panic < -0.25 else "split"
+    match_state = (
+        "the match is producing real chances"
+        if stability >= 0.45
+        else "the match itself is fairly quiet"
+        if stability <= 0.2
+        else "the match is evenly balanced"
+    )
+    who = ""
+    if team_summary:
+        moods = {
+            side: str(info.get("dominant", "neutral"))
+            for side, info in team_summary.items()
+            if info.get("volume")
+        }
+        named = {
+            side: str(team_summary[side].get("team", side)) for side in moods
+        }
+        if moods:
+            who = (
+                " "
+                + " | ".join(
+                    f"{named[s]} fans: {moods[s]}" for s in moods
+                )
+                + "."
+            )
+    if gap >= threshold and panic > 0:
+        tail = "fans are spiking faster than the pitch justifies — a possible overreaction."
+    elif panic <= -0.4 and stability < 0.3:
+        tail = "fans look relaxed even though the game is flat — watch for a momentum swing."
+    else:
+        tail = "fan mood and the match are roughly in step."
+    return f"Right now: fans are {mood} while {match_state} — {tail}{who}"

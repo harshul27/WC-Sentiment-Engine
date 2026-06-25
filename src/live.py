@@ -256,13 +256,22 @@ def current_capture_match(
 
 
 def live_streams(match: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
-    """Fetch both live inputs (multi-source fan chat, commentary)."""
+    """Fetch both live inputs (multi-source fan chat, commentary).
+
+    The returned chat carries a `team` column (home|away|both|neither) so the
+    dashboard can break the crowd mood down by team.
+    """
     import sources
+    import teams
 
     commentary = fetch_match_commentary(str(match["event_id"]))
-    terms = [str(t) for t in (match.get("home_team"), match.get("away_team")) if t]
+    home_team = str(match.get("home_team") or "")
+    away_team = str(match.get("away_team") or "")
+    terms = [t for t in (home_team, away_team) if t]
     posts = sources.gather_reactions(terms)
     chat = posts_to_chat(posts, match["kickoff_utc"])
+    if not chat.empty:
+        chat["team"] = teams.tag_reactions(chat["message"], home_team, away_team)
     return chat, commentary
 
 
