@@ -184,8 +184,8 @@ def posts_to_chat(
         )
     elapsed = (stamps.loc[recent.index] - kickoff).dt.total_seconds() // 60
     recent["minute"] = elapsed.clip(lower=0, upper=max_minute).astype("int64")
-    columns = ["minute", "message"] + (["source"] if "source" in recent.columns else [])
-    return recent[columns].reset_index(drop=True)
+    carried = [c for c in ("source", "team", "author") if c in recent.columns]
+    return recent[["minute", "message", *carried]].reset_index(drop=True)
 
 
 POST_GRACE = timedelta(minutes=15)
@@ -255,24 +255,56 @@ def current_capture_match(
     return None
 
 
-def live_streams(match: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
-    """Fetch both live inputs (multi-source fan chat, commentary).
+def gather_live_reactions(match: pd.Series) -> pd.DataFrame:
+    """Cleaned, multi-source raw reactions for a fixture, tagged by team.
 
-    The returned chat carries a `team` column (home|away|both|neither) so the
-    dashboard can break the crowd mood down by team.
+    Columns: created_utc, message, source, author, team (home|away|both|
+    neither). Raw (not yet mapped to minutes) so callers can accumulate a
+    rolling buffer across refreshes before scoring.
     """
     import sources
     import teams
 
-    commentary = fetch_match_commentary(str(match["event_id"]))
     home_team = str(match.get("home_team") or "")
     away_team = str(match.get("away_team") or "")
     terms = [t for t in (home_team, away_team) if t]
     posts = sources.gather_reactions(terms)
-    chat = posts_to_chat(posts, match["kickoff_utc"])
-    if not chat.empty:
-        chat["team"] = teams.tag_reactions(chat["message"], home_team, away_team)
+    if not posts.empty:
+        posts = posts.copy()
+        posts["team"] = teams.tag_reactions(posts["message"], home_team, away_team)
+    return posts
+
+
+def live_streams(match: pd.Series) -> tuple[pd.DataFrame, pd.Series]:
+    """Fetch both live inputs (multi-source fan chat, commentary).
+
+    The returned chat carries `source`/`team` columns so the dashboard can
+    break the crowd mood down by team. Single-fetch (no buffer) - used by the
+    stateless pipeline; the live UI uses live_streams_buffered.
+    """
+    commentary = fetch_match_commentary(str(match["event_id"]))
+    chat = posts_to_chat(gather_live_reactions(match), match["kickoff_utc"])
     return chat, commentary
+
+
+def live_streams_buffered(
+    match: pd.Series,
+    prior_reactions: pd.DataFrame | None = None,
+    window: int | None = None,
+) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+    """Live inputs with a rolling reaction buffer accumulated across refreshes.
+
+    Merges this refresh's reactions into `prior_reactions` (de-duplicated,
+    newest `window` kept) so the crowd window grows over a match. Returns
+    (minute-mapped chat, commentary, merged raw buffer to carry forward).
+    """
+    import sources
+
+    cap = sources.COMMENT_WINDOW if window is None else window
+    commentary = fetch_match_commentary(str(match["event_id"]))
+    merged = sources.merge_window(prior_reactions, gather_live_reactions(match), cap)
+    chat = posts_to_chat(merged, match["kickoff_utc"])
+    return chat, commentary, merged
 
 
 def utc_now() -> datetime:
