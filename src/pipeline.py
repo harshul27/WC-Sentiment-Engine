@@ -278,6 +278,10 @@ def run_ingest(allow_simulator: bool = True) -> pd.DataFrame:
     )
     if warehouse.enabled():
         synced = warehouse.sync_from_disk(STATE_PATH.parent)
+        if match_row is not None:
+            # Persist the individual reactions for real fixtures only (skip the
+            # simulator/feed) so the full per-match set lands in Supabase.
+            synced["reactions"] = warehouse.push_reactions(chat, match_id)
         print(f"[run] mirrored to supabase: {synced}")
     print(
         f"[run] match_id={match_id} rows={len(state)} "

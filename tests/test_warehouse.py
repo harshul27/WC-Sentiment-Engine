@@ -1,6 +1,8 @@
 """Tests for the Supabase mirror in src/warehouse.py (offline, key-gated)."""
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -67,6 +69,39 @@ def test_push_records_survives_http_error(monkeypatch: pytest.MonkeyPatch) -> No
         warehouse.requests, "post", lambda *a, **k: FakeResponse(500)
     )
     assert warehouse.push_records("match_archive", [{"match_id": "x", "minute": 1}]) == 0
+
+
+def test_push_reactions_keys_and_dedupes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
+    monkeypatch.setenv("SUPABASE_KEY", "service-key")
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        warehouse.requests,
+        "post",
+        lambda url, **k: captured.update(url=url, data=k.get("data")) or FakeResponse(201),
+    )
+    chat = pd.DataFrame(
+        {
+            "minute": [10, 10, 11],
+            "message": ["we are choking", "we are choking", "what a goal"],
+            "source": ["bluesky", "mastodon", "reddit"],
+            "team": ["home", "home", "away"],
+            "author": ["a", "b", "c"],
+        }
+    )
+    sent = warehouse.push_reactions(chat, "ESPN-1")
+    assert sent == 2  # duplicate message collapsed by (match_id, message_hash)
+    assert captured["url"].endswith("/rest/v1/reactions")
+    payload = json.loads(captured["data"])
+    assert {r["message_hash"] for r in payload}  # hashes present
+    assert all(r["match_id"] == "ESPN-1" for r in payload)
+
+
+def test_push_reactions_disabled_or_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert warehouse.push_reactions(pd.DataFrame({"message": ["x"]}), "ESPN-1") == 0  # no keys
+    monkeypatch.setenv("SUPABASE_URL", "https://proj.supabase.co")
+    monkeypatch.setenv("SUPABASE_KEY", "k")
+    assert warehouse.push_reactions(pd.DataFrame(), "ESPN-1") == 0  # empty
 
 
 def test_push_status_drops_nested_fields(monkeypatch: pytest.MonkeyPatch) -> None:

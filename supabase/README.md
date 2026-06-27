@@ -11,7 +11,9 @@ or a push fails, the pipeline is unaffected.
 1. Create a free project at https://supabase.com (free tier is plenty for this
    data volume — a few thousand rows).
 2. In the dashboard: **SQL → New query**, paste [`schema.sql`](schema.sql), run it.
-   This creates `match_results`, `match_archive`, `engine_state`, `run_status`.
+   This creates `match_results`, `match_archive`, `engine_state`, `run_status`,
+   and `reactions` (the individual cleaned fan reactions per match — stored here
+   instead of git, accumulating over the match via upsert).
 3. Get your credentials from **Project Settings → API**:
    - `SUPABASE_URL` = the Project URL (e.g. `https://abcd1234.supabase.co`)
    - `SUPABASE_KEY` = the **service_role** key (server-side; it can write).
