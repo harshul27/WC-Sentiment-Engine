@@ -130,29 +130,31 @@ def test_fetchers_survive_network_failure(monkeypatch: pytest.MonkeyPatch) -> No
     assert sources.fetch_mastodon(["worldcup"]).empty
 
 
+def _reaction_frame(n: int, source: str, **over) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "created_utc": pd.date_range("2026-06-11T19:00:00Z", periods=n, freq="10s"),
+            "message": over.get(
+                "messages", [f"what a goal from Mexico, take {i}" for i in range(n)]
+            ),
+            "source": source,
+            "author": over.get("author", ""),
+        }
+    )
+
+
 def test_gather_reactions_caps_window_and_dedupes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_source(n: int, source: str):
-        return pd.DataFrame(
-            {
-                "created_utc": pd.date_range(
-                    "2026-06-11T19:00:00Z", periods=n, freq="10s"
-                ),
-                "message": [f"{source} comment {i}" for i in range(n)],
-                "source": source,
-            }
-        )
-
-    big = fake_source(250, "bluesky")
+    big = _reaction_frame(1200, "bluesky")
     duplicate = big.copy()
-    monkeypatch.setattr(sources, "fetch_bluesky", lambda terms: big)
-    monkeypatch.setattr(sources, "fetch_mastodon", lambda tags: duplicate)
-    monkeypatch.setattr(sources, "fetch_reddit", lambda terms: sources._empty())
-    monkeypatch.setattr(sources, "fetch_youtube", lambda query: sources._empty())
-    monkeypatch.setattr(sources, "fetch_x", lambda terms: sources._empty())
+    monkeypatch.setattr(sources, "fetch_bluesky", lambda *a, **k: big)
+    monkeypatch.setattr(sources, "fetch_mastodon", lambda *a, **k: duplicate)
+    monkeypatch.setattr(sources, "fetch_reddit", lambda *a, **k: sources._empty())
+    monkeypatch.setattr(sources, "fetch_youtube", lambda *a, **k: sources._empty())
+    monkeypatch.setattr(sources, "fetch_x", lambda *a, **k: sources._empty())
     merged = sources.gather_reactions(["Mexico", "South Africa"])
-    assert len(merged) == sources.COMMENT_WINDOW
+    assert len(merged) == sources.COMMENT_WINDOW == 1000
     assert merged["created_utc"].is_monotonic_increasing
     assert merged["message"].is_unique
 
@@ -161,3 +163,61 @@ def test_gather_reactions_all_sources_empty(monkeypatch: pytest.MonkeyPatch) -> 
     for name in ("fetch_bluesky", "fetch_mastodon", "fetch_reddit", "fetch_youtube", "fetch_x"):
         monkeypatch.setattr(sources, name, lambda *a, **k: sources._empty())
     assert sources.gather_reactions(["Mexico"]).empty
+
+
+def test_clean_reactions_filters_jargon_and_bots() -> None:
+    frame = pd.DataFrame(
+        {
+            "created_utc": pd.date_range("2026-06-11T19:00Z", periods=6, freq="5s"),
+            "message": [
+                "Mexico are choking, what a disaster",  # keep
+                "⚽⚽⚽",  # drop: emoji-only / too short
+                "https://t.co/x",  # drop: link-only
+                "the weather is nice today and warm",  # drop: off-topic (no team/football)
+                "great goal by South Africa there",  # keep (football keyword)
+                "MATCH THREAD: Mexico vs South Africa",  # keep but from a bot below
+            ],
+            "source": ["bluesky"] * 6,
+            "author": ["fan1", "fan2", "fan3", "fan4", "fan5", "AutoModerator"],
+        }
+    )
+    cleaned = sources.clean_reactions(frame, ["Mexico", "South Africa"])
+    msgs = cleaned["message"].tolist()
+    assert "Mexico are choking, what a disaster" in msgs
+    assert "great goal by South Africa there" in msgs
+    assert "⚽⚽⚽" not in msgs
+    assert "https://t.co/x" not in msgs
+    assert "the weather is nice today and warm" not in msgs
+    assert not cleaned["author"].str.lower().eq("automoderator").any()
+
+
+def test_clean_reactions_caps_per_author_flood() -> None:
+    frame = _reaction_frame(
+        20, "youtube", messages=[f"Mexico goal moment {i}" for i in range(20)],
+        author="spammer",
+    )
+    cleaned = sources.clean_reactions(frame, ["Mexico"])
+    assert len(cleaned) == sources.MAX_PER_AUTHOR
+
+
+def test_merge_window_accumulates_and_caps() -> None:
+    prior = _reaction_frame(600, "bluesky")  # 19:00 .. 19:49:55 (5s spacing)
+    new = _reaction_frame(
+        600, "reddit", messages=[f"South Africa shot number {i}" for i in range(600)]
+    )
+    new["created_utc"] = pd.date_range(  # strictly later than every prior post
+        "2026-06-11T21:00Z", periods=600, freq="5s"
+    )
+    merged = sources.merge_window(prior, new, window=1000)
+    assert len(merged) == 1000
+    assert merged["created_utc"].is_monotonic_increasing
+    # every newest (reddit) reaction is retained; the oldest prior ones drop off
+    merged_keys = set(merged["message"].map(sources._normalise))
+    new_keys = set(new["message"].map(sources._normalise))
+    assert new_keys <= merged_keys
+
+
+def test_merge_window_dedupes_repeated_reactions() -> None:
+    prior = _reaction_frame(10, "bluesky")
+    merged = sources.merge_window(prior, prior.copy(), window=1000)
+    assert len(merged) == 10

@@ -27,7 +27,11 @@ import re
 import pandas as pd
 import requests
 
-COMMENT_WINDOW = 200
+COMMENT_WINDOW = 1000
+# Per-author flood cap and minimum readable length keep one spammer or a wall
+# of emotes from dominating a minute.
+MAX_PER_AUTHOR = 5
+MIN_WORDS = 3
 USER_AGENT = {"User-Agent": "wc-sentiment-engine/0.1"}
 BLUESKY_SEARCH = "https://api.bsky.app/xrpc/app.bsky.feed.searchPosts"
 MASTODON_INSTANCE = os.environ.get("MASTODON_INSTANCE", "https://mastodon.social")
@@ -37,8 +41,33 @@ XAI_RESPONSES = "https://api.x.ai/v1/responses"
 XAI_MODEL = os.environ.get("XAI_MODEL", "grok-4.3")
 
 _HTML_TAG = re.compile(r"<[^>]+>")
+_URL = re.compile(r"https?://\S+")
+_MENTION = re.compile(r"[@#]\w+")
+_WORD = re.compile(r"[^\W\d_]{2,}", re.UNICODE)  # word-ish token, any language
 
-REACTION_COLUMNS = ["created_utc", "message", "source"]
+# Automod/chat bots whose posts are not fan reactions.
+_BOT_AUTHORS = {
+    "automoderator",
+    "nightbot",
+    "streamelements",
+    "moderator",
+    "wadu",
+    "fossabot",
+    "soccerbot",
+    "sports_bot",
+    "botrickbateman",
+}
+
+# Football vocabulary (multi-lingual) used as a lenient relevance gate so a
+# generic on-topic reaction ("what a goal") survives even without a team name.
+_FOOTBALL_KEYWORDS = {
+    "goal", "gol", "golazo", "golaco", "but", "penalty", "penal", "ref", "var",
+    "offside", "keeper", "save", "shot", "corner", "foul", "header", "miss",
+    "score", "draw", "win", "lose", "red card", "yellow", "match", "game",
+    "tournament", "world cup", "worldcup",
+}
+
+REACTION_COLUMNS = ["created_utc", "message", "source", "author"]
 
 
 def _empty() -> pd.DataFrame:
@@ -49,13 +78,16 @@ def _frame(rows: list[dict[str, object]]) -> pd.DataFrame:
     if not rows:
         return _empty()
     frame = pd.DataFrame(rows)
+    if "author" not in frame.columns:
+        frame["author"] = ""
+    frame["author"] = frame["author"].fillna("").astype(str)
     frame["created_utc"] = pd.to_datetime(frame["created_utc"], utc=True, errors="coerce")
     frame = frame.dropna(subset=["created_utc"])
     frame["message"] = frame["message"].astype(str).str.strip()
     return frame.loc[frame["message"] != "", REACTION_COLUMNS]
 
 
-def fetch_bluesky(terms: list[str], limit: int = 50, timeout: float = 15.0) -> pd.DataFrame:
+def fetch_bluesky(terms: list[str], limit: int = 100, timeout: float = 15.0) -> pd.DataFrame:
     """Latest Bluesky posts mentioning any search term."""
     rows: list[dict[str, object]] = []
     seen: set[str] = set()
@@ -82,6 +114,7 @@ def fetch_bluesky(terms: list[str], limit: int = 50, timeout: float = 15.0) -> p
                     "created_utc": record.get("createdAt"),
                     "message": record.get("text", ""),
                     "source": "bluesky",
+                    "author": str((post.get("author") or {}).get("handle", "")),
                 }
             )
     return _frame(rows)
@@ -116,6 +149,7 @@ def fetch_mastodon(tags: list[str], limit: int = 40, timeout: float = 15.0) -> p
                     "created_utc": post.get("created_at"),
                     "message": _HTML_TAG.sub(" ", str(post.get("content", ""))),
                     "source": "mastodon",
+                    "author": str((post.get("account") or {}).get("acct", "")),
                 }
             )
     return _frame(rows)
@@ -186,6 +220,7 @@ def fetch_reddit(team_terms: list[str], limit: int = 100, timeout: float = 15.0)
                 "created_utc": pd.Timestamp(float(data.get("created_utc", 0)), unit="s", tz="UTC"),
                 "message": data.get("body", ""),
                 "source": "reddit",
+                "author": str(data.get("author", "")),
             }
         )
     return _frame(rows)
@@ -236,8 +271,8 @@ def fetch_youtube(query: str, limit: int = 100, timeout: float = 15.0) -> pd.Dat
             f"{base}/liveChat/messages",
             params={
                 "liveChatId": chat_id,
-                "part": "snippet",
-                "maxResults": min(limit, 200),
+                "part": "snippet,authorDetails",
+                "maxResults": min(limit, 500),
                 "key": key,
             },
             timeout=timeout,
@@ -252,6 +287,7 @@ def fetch_youtube(query: str, limit: int = 100, timeout: float = 15.0) -> pd.Dat
             "created_utc": m.get("snippet", {}).get("publishedAt"),
             "message": m.get("snippet", {}).get("displayMessage", ""),
             "source": "youtube",
+            "author": str(m.get("authorDetails", {}).get("displayName", "")),
         }
         for m in messages
     ]
@@ -336,21 +372,92 @@ def fetch_x(team_terms: list[str], limit: int = 50, timeout: float = 30.0) -> pd
             "created_utc": post.get("created_at") or now,
             "message": post.get("text", ""),
             "source": "x",
+            "author": str(post.get("handle") or post.get("author") or ""),
         }
         for post in posts
     ]
     return _frame(rows)
 
 
+def _normalise(message: str) -> str:
+    """Lowercased, URL/mention-stripped, repeated-char-collapsed key for dedup."""
+    text = _URL.sub(" ", str(message).lower())
+    text = _MENTION.sub(" ", text)
+    text = re.sub(r"(.)\1{2,}", r"\1\1", text)  # gooooal -> gooal
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_readable(message: str) -> bool:
+    """Keep only messages with enough real words (not pure emoji/links/punct)."""
+    stripped = _MENTION.sub(" ", _URL.sub(" ", str(message)))
+    return len(_WORD.findall(stripped)) >= MIN_WORDS
+
+
+def _is_relevant(message: str, terms: list[str]) -> bool:
+    """Lenient on-topic gate: mentions a team or any football keyword."""
+    if not terms:
+        return True
+    low = str(message).lower()
+    if any(t.lower() in low for t in terms if t):
+        return True
+    return any(kw in low for kw in _FOOTBALL_KEYWORDS)
+
+
+def clean_reactions(
+    frame: pd.DataFrame, team_terms: list[str] | None = None
+) -> pd.DataFrame:
+    """Drop bots, low-content, off-topic, and per-author floods.
+
+    Removes the jargon/trash that erodes the mood signal: automod/chat bots,
+    emoji/link-only or too-short posts, off-topic chatter, near-duplicate
+    copypasta, and any single author posting more than MAX_PER_AUTHOR times.
+    """
+    if frame is None or frame.empty:
+        return _empty()
+    work = frame.copy()
+    if "author" not in work.columns:
+        work["author"] = ""
+    author = work["author"].fillna("").astype(str).str.lower()
+    work = work.loc[~author.isin(_BOT_AUTHORS) & ~author.str.endswith("bot")]
+    work = work.loc[work["message"].map(_is_readable)]
+    if team_terms is not None:
+        work = work.loc[work["message"].map(lambda m: _is_relevant(m, team_terms))]
+    if work.empty:
+        return _empty()
+    work = work.loc[~work["message"].map(_normalise).duplicated()]
+    nonblank = work["author"].astype(str).str.strip() != ""
+    rank = work.groupby("author").cumcount()
+    work = work.loc[~nonblank | (rank < MAX_PER_AUTHOR)]
+    return work.reset_index(drop=True)
+
+
+def merge_window(
+    prior: pd.DataFrame | None, new: pd.DataFrame, window: int = COMMENT_WINDOW
+) -> pd.DataFrame:
+    """Accumulate reactions across ticks: union, de-dup, keep newest `window`.
+
+    Lets the live view build a rolling buffer (up to `window` reactions) over a
+    match instead of replacing it every refresh.
+    """
+    parts = [f for f in (prior, new) if f is not None and not f.empty]
+    if not parts:
+        return _empty()
+    merged = pd.concat(parts, ignore_index=True)
+    merged = merged.loc[~merged["message"].map(_normalise).duplicated()]
+    return (
+        merged.sort_values("created_utc").tail(window).reset_index(drop=True)
+    )
+
+
 def gather_reactions(
     team_terms: list[str], window: int = COMMENT_WINDOW
 ) -> pd.DataFrame:
-    """All available sources merged, deduplicated, newest `window` comments."""
+    """All sources merged, cleaned of jargon/bots, newest `window` comments."""
     frames = [
         fetch_bluesky(team_terms),
         fetch_mastodon([*team_terms, "worldcup"]),
-        fetch_reddit(team_terms),
-        fetch_youtube(" vs ".join(team_terms[:2]) + " live"),
+        fetch_reddit(team_terms, limit=150),
+        fetch_youtube(" vs ".join(team_terms[:2]) + " live", limit=300),
         fetch_x(team_terms),
     ]
     merged = pd.concat([f for f in frames if not f.empty], ignore_index=True) if any(
@@ -358,9 +465,11 @@ def gather_reactions(
     ) else _empty()
     if merged.empty:
         return merged
-    merged = merged.drop_duplicates(subset="message")
+    cleaned = clean_reactions(merged, team_terms)
+    if cleaned.empty:
+        return cleaned
     return (
-        merged.sort_values("created_utc")
+        cleaned.sort_values("created_utc")
         .tail(window)
         .reset_index(drop=True)
     )

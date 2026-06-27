@@ -34,7 +34,13 @@ from emotion import (
     scored_share,
     team_emotion_summary,
 )
-from live import POST_GRACE, capture_phase, fetch_scoreboard, live_streams, utc_now
+from live import (
+    POST_GRACE,
+    capture_phase,
+    fetch_scoreboard,
+    live_streams_buffered,
+    utc_now,
+)
 from matchstats import KEY_STATS, control_index, fetch_boxscore, fetch_sofascore_momentum
 from model import ArbitrageSelector, MatchProgressionAgent, load_config
 from pipeline import fill_emotion_columns, simulate_streams
@@ -292,16 +298,26 @@ def render_flags(frame: pd.DataFrame) -> None:
 
 
 def render_reactions(chat: pd.DataFrame) -> None:
-    """The 200-comment multi-source window behind the emotion profile."""
+    """The rolling multi-source reaction window behind the emotion profile."""
     with st.expander(f"💬 Crowd reactions analysed ({len(chat)})"):
         if chat.empty:
             st.caption("No fan reactions matched this fixture yet.")
             return
+        st.caption(
+            "Rolling window of up to 1,000 reactions, accumulated across the "
+            "match and cleaned of bots, links, emoji-only spam and off-topic chatter."
+        )
         if "source" in chat.columns:
             counts = chat["source"].value_counts()
             st.caption(
                 "Sources: "
                 + ", ".join(f"{src} {n}" for src, n in counts.items())
+            )
+        if "team" in chat.columns:
+            team_counts = chat["team"].value_counts().to_dict()
+            st.caption(
+                "Team tag: "
+                + ", ".join(f"{k} {v}" for k, v in team_counts.items())
             )
         if "message" in chat.columns:
             share = scored_share(chat["message"])
@@ -552,7 +568,9 @@ def live_panel(event_id: str) -> None:
         )
         return
 
-    chat, commentary = live_streams(match)
+    buffers = st.session_state.setdefault("reaction_buffer", {})
+    chat, commentary, merged_raw = live_streams_buffered(match, buffers.get(event_id))
+    buffers[event_id] = merged_raw
     if commentary.empty:
         if str(match["state"]) == "in":
             st.warning(
