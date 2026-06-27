@@ -71,3 +71,18 @@ create table if not exists run_status (
     n_commentary  integer,
     fetch_ok      boolean
 );
+
+-- Individual cleaned fan reactions per match. Keyed on (match_id,
+-- message_hash) so the same reaction seen on a later flywheel run upserts
+-- rather than duplicating; the set accumulates over the match here instead of
+-- in git. message_hash = first 24 hex chars of sha256(message).
+create table if not exists reactions (
+    match_id     text not null,
+    message_hash text not null,
+    minute       integer,
+    message      text,
+    source       text,
+    team         text,
+    author       text,
+    primary key (match_id, message_hash)
+);

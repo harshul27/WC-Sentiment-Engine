@@ -17,6 +17,7 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -119,6 +120,42 @@ def push_status(status: dict[str, object]) -> int:
         return 0
     row = {k: _clean(v) for k, v in status.items() if not isinstance(v, (dict, list))}
     return push_records("run_status", [row])
+
+
+def push_reactions(chat: pd.DataFrame, match_id: str) -> int:
+    """Persist a match's individual reactions (keyed so re-fetches upsert).
+
+    The live UI keeps the rolling window in memory; this stores the raw
+    cleaned reactions in Supabase instead of git, so the full per-match set
+    accumulates over the flywheel's runs without bloating the repo. The key is
+    (match_id, message_hash), so the same reaction seen on a later run merges.
+    """
+    if not enabled() or chat is None or chat.empty or "message" not in chat.columns:
+        return 0
+    rows: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    mid = str(match_id)
+    for _, row in chat.iterrows():
+        message = str(row.get("message", "")).strip()
+        if not message:
+            continue
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()[:24]
+        key = (mid, digest)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
+            {
+                "match_id": mid,
+                "message_hash": digest,
+                "minute": _clean(row.get("minute")),
+                "message": message,
+                "source": str(row.get("source", "")),
+                "team": str(row.get("team", "")),
+                "author": str(row.get("author", "")),
+            }
+        )
+    return push_records("reactions", rows)
 
 
 def sync_from_disk(data_dir: Path = DATA_DIR) -> dict[str, int]:
