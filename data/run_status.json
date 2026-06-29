@@ -1,13 +1,13 @@
 {
-  "last_run_utc": "2026-06-29T17:49:18+00:00",
+  "last_run_utc": "2026-06-29T19:49:07+00:00",
   "match_id": "ESPN-760487",
   "source": "live",
   "live": true,
-  "n_reactions": 209,
-  "n_commentary": 36,
+  "n_reactions": 226,
+  "n_commentary": 89,
   "reactions_by_source": {
-    "bluesky": 144,
-    "mastodon": 65
+    "bluesky": 133,
+    "mastodon": 93
   },
   "fetch_ok": true
 }
