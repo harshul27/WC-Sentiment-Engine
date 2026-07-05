@@ -206,6 +206,14 @@
       "evaluated_minutes": 7660,
       "matches": 72,
       "source": "match_archive"
+    },
+    {
+      "timestamp": "2026-07-05T02:47:33+00:00",
+      "log_loss": 0.292698,
+      "threshold": 0.55,
+      "evaluated_minutes": 7922,
+      "matches": 74,
+      "source": "match_archive"
     }
   ]
 }
