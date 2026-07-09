@@ -105,7 +105,10 @@ def push_records(
         )
         response.raise_for_status()
     except (requests.RequestException, ValueError) as exc:
-        print(f"[warehouse] {table}: push failed ({type(exc).__name__})")
+        # Detail matters for ops: GitHub masks secret values in logs, so the
+        # host/status in the message is safe and tells us *why* (DNS, paused
+        # project, 401, bad table) instead of just the exception class.
+        print(f"[warehouse] {table}: push failed ({type(exc).__name__}: {exc})")
         return 0
     return len(rows)
 
