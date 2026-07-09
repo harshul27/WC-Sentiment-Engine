@@ -487,11 +487,15 @@ def generate_takeaways(
     state: pd.DataFrame,
     threshold: float,
     match_stats: dict[str, dict[str, str]] | None = None,
+    keeper: dict[str, dict[str, float]] | None = None,
 ) -> list[dict[str, str]]:
     """Plain-language product takeaways relating crowd emotion to the game.
 
     Each takeaway: {"tone": info|warning|positive, "headline": ..., "detail": ...}.
-    Rules fire on the latest scored minute of the supplied state frame.
+    Rules fire on the latest scored minute of the supplied state frame. When
+    per-player keeper workload is supplied (matchstats.keeper_pressure), an
+    extra rule relates fan negativity to a keeper visibly keeping the side in
+    the game.
     """
     if state.empty:
         return [
@@ -563,6 +567,26 @@ def generate_takeaways(
                 ),
             }
         )
+    if keeper and panic > 0.3:
+        busiest = max(keeper.values(), key=lambda k: float(k.get("saves", 0.0)))
+        saves = float(busiest.get("saves", 0.0))
+        if saves >= 3:
+            takeaways.append(
+                {
+                    "tone": "info",
+                    "headline": "Keeper holding the line",
+                    "detail": (
+                        f"Fans are anxious, but {busiest.get('keeper', 'the keeper')} "
+                        f"has made {saves:.0f} saves"
+                        + (
+                            f" from {float(busiest.get('shots_faced', 0.0)):.0f} shots faced"
+                            if float(busiest.get("shots_faced", 0.0)) > 0
+                            else ""
+                        )
+                        + " - the pressure is real but it is being handled."
+                    ),
+                }
+            )
     if not takeaways:
         takeaways.append(
             {
