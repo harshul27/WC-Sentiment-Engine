@@ -43,7 +43,15 @@ LABELS: dict[str, tuple[str, str]] = {
     ),
     "flagged": (
         "Overreaction Moments",
-        "Minutes where the crowd spiked but the match itself stayed calm.",
+        "Minutes where fan mood conflicts with the game situation - panic or "
+        "anger while the match is stable, or celebration and calm while the "
+        "team is losing and creating nothing.",
+    ),
+    "clarity": (
+        "Mood Clarity",
+        "How decisive this team's mood reading is: one clear emotion from "
+        "many readable reactions scores high; a thin or mixed signal scores "
+        "low and should be held loosely.",
     ),
     "sentiment_market_divergence": (
         "Mood-vs-Odds Gap",
@@ -83,6 +91,13 @@ GUIDE: list[tuple[str, str]] = [
         "Hype-vs-Reality Gap",
         "When fans are spiking but the match is calm, the gap is wide - a "
         "possible overreaction. That is the moment the engine flags.",
+    ),
+    (
+        "Overreaction Moments",
+        "Defined as minutes where fan mood conflicts with the game situation: "
+        "panic or anger while the match is stable and the team is not under "
+        "threat, or celebration and confidence while the team is losing and "
+        "creating nothing. Each flagged moment carries its reason.",
     ),
     (
         "Is it trustworthy?",

@@ -21,6 +21,7 @@ import streamlit as st
 
 sys.path.append(str(Path(__file__).resolve().parent))
 
+import consistency
 import glossary
 import health
 import odds
@@ -41,7 +42,16 @@ from live import (
     live_streams_buffered,
     utc_now,
 )
-from matchstats import KEY_STATS, control_index, fetch_boxscore, fetch_sofascore_momentum
+from matchstats import (
+    ADVANCED_STATS,
+    KEY_STATS,
+    control_index,
+    fetch_match_detail,
+    fetch_sofascore_momentum,
+    goal_scorers,
+    keeper_pressure,
+    top_performers,
+)
 from model import ArbitrageSelector, MatchProgressionAgent, load_config
 from pipeline import fill_emotion_columns, simulate_streams
 from situation import classify, metrics_that_matter, situation_brief
@@ -66,6 +76,20 @@ STAT_LABELS = {
     "wonCorners": "Corners",
     "saves": "Saves",
     "foulsCommitted": "Fouls",
+}
+ADVANCED_STAT_LABELS = {
+    "accuratePasses": "Accurate Passes",
+    "passPct": "Pass %",
+    "totalTackles": "Tackles",
+    "interceptions": "Interceptions",
+    "effectiveClearance": "Clearances",
+    "blockedShots": "Blocked Shots",
+    "accurateCrosses": "Accurate Crosses",
+}
+FLAG_REASON_LABELS = {
+    "panic-vs-stable": "Panic while the match was stable",
+    "positive-while-losing": "Celebration while losing",
+    "panic-while-ahead": "Panic while ahead",
 }
 
 
@@ -265,23 +289,31 @@ def render_market(market: dict, latest_panic: float) -> None:
     )
 
 
-def render_takeaways(frame: pd.DataFrame, match_stats: dict | None = None) -> None:
+def render_takeaways(
+    frame: pd.DataFrame, match_stats: dict | None = None, keeper: dict | None = None
+) -> None:
     st.subheader("💡 What This Means Right Now")
-    for takeaway in generate_takeaways(frame, active_threshold(), match_stats):
+    for takeaway in generate_takeaways(frame, active_threshold(), match_stats, keeper):
         renderer = TONE_RENDERERS.get(takeaway["tone"], st.info)
         renderer(f"**{takeaway['headline']}** — {takeaway['detail']}")
 
 
-def render_flags(frame: pd.DataFrame) -> None:
+def render_flags(frame: pd.DataFrame, conflicts: list[dict] | None = None) -> None:
     flagged = frame.loc[frame["flagged"]].sort_values("arbitrage_index", ascending=False)
     st.subheader("🚩 Overreaction Moments")
     st.caption(
-        "Minutes where fans spiked but the match itself stayed calm — the "
-        "widest Hype-vs-Reality gaps."
+        "**Definition:** minutes where fan mood conflicts with the game "
+        "situation — panic or anger while the match is stable, or celebration "
+        "and confidence while the team is losing and creating nothing."
     )
+    for moment in conflicts or []:
+        label = FLAG_REASON_LABELS.get(str(moment.get("reason")), "Mood-vs-game conflict")
+        st.warning(f"**{label} — {moment.get('team', '')} (now):** {moment.get('detail', '')}")
     if flagged.empty:
-        st.info("No overreaction moments in the current window.")
+        if not conflicts:
+            st.info("No overreaction moments in the current window.")
         return
+    st.caption("Flagged minutes (reason: panic while the match was stable):")
     badge_cols = st.columns(min(4, len(flagged)))
     for slot, (_, row) in zip(badge_cols, flagged.iterrows()):
         slot.metric(
@@ -338,8 +370,8 @@ def render_headline(
     st.info(sentence)
 
 
-def render_team_moods(team_summary: dict) -> None:
-    """Per-team crowd mood so a single emotion is never ambiguous."""
+def render_team_moods(team_summary: dict, verdicts: dict | None = None) -> None:
+    """Per-team crowd mood with clarity + a mood-vs-game consistency check."""
     if not team_summary:
         return
     st.subheader("👥 Mood by Team")
@@ -348,6 +380,7 @@ def render_team_moods(team_summary: dict) -> None:
     icons = {"home": "🏠", "away": "🛫"}
     for slot, side in zip(cols, sides):
         info = team_summary[side]
+        verdict = (verdicts or {}).get(side, {})
         volume = int(info.get("volume", 0))
         slot.metric(
             f"{icons[side]} {info.get('team', side)} fans",
@@ -355,11 +388,23 @@ def render_team_moods(team_summary: dict) -> None:
             help=f"Loudest emotion among {volume} reactions mentioning this team "
             f"(reading coverage {float(info.get('coverage', 0.0)):.0%}).",
         )
+        clarity = verdict.get("clarity")
+        if clarity is None:
+            clarity = consistency.clarity_score(info)
+        slot.metric(
+            glossary.label("clarity"),
+            f"{float(clarity):.0%}",
+            help=glossary.tooltip("clarity"),
+        )
         slot.caption(f"{volume} reactions")
-    # crude overall denominator for a coverage line
+        if verdict.get("verdict") == "conflict":
+            slot.warning(f"⚠️ {verdict.get('explanation', 'Mood conflicts with the game situation.')}")
+        elif verdict:
+            slot.caption(f"✓ {verdict.get('explanation', '')}")
     st.caption(
         "Each reaction is tagged by the team it names; posts mentioning both "
-        "count for both sides. Reactions naming neither team are not shown here."
+        "count for both sides. Mood is checked against the live scoreline - a "
+        "losing side reading as joyful is flagged, not hidden."
     )
 
 
@@ -377,6 +422,18 @@ def render_match_stats(match_stats: dict, momentum: pd.DataFrame | None = None) 
     }
     frame = pd.DataFrame(table, index=teams_order).T
     st.dataframe(frame, use_container_width=True)
+    advanced = {
+        ADVANCED_STAT_LABELS[key]: [match_stats[t].get(key, "—") for t in teams_order]
+        for key in ADVANCED_STATS
+        if key in ADVANCED_STAT_LABELS
+        and any(key in match_stats[t] for t in teams_order)
+    }
+    if advanced:
+        with st.expander("📊 Advanced team stats (passing & defending)"):
+            st.dataframe(
+                pd.DataFrame(advanced, index=teams_order).T,
+                use_container_width=True,
+            )
     control = control_index(match_stats)
     if control is not None and teams_order:
         st.caption(
@@ -394,6 +451,32 @@ def render_match_stats(match_stats: dict, momentum: pd.DataFrame | None = None) 
             "Deeper xG/attack-momentum runs in local mode only — Sofascore "
             "blocks cloud server IPs, so the public app shows the ESPN stats above."
         )
+
+
+def render_performers(
+    leaders: dict, key_events: list, keeper: dict | None = None
+) -> None:
+    """Key performers per team + goalscorers, from the same ESPN payload."""
+    lines = top_performers(leaders)
+    goals = goal_scorers(key_events)
+    if not lines and not goals and not keeper:
+        return
+    st.subheader("⭐ Key Performers")
+    if goals:
+        st.caption("Goals: " + " | ".join(goals))
+    for team, line in lines.items():
+        st.caption(f"**{team}** — {line}")
+    for team, info in (keeper or {}).items():
+        saves = float(info.get("saves", 0.0))
+        if saves >= 3:
+            st.caption(
+                f"🧤 {info.get('keeper', '')} ({team}) is busy: {saves:.0f} saves"
+                + (
+                    f" from {float(info.get('shots_faced', 0.0)):.0f} shots faced."
+                    if float(info.get("shots_faced", 0.0)) > 0
+                    else "."
+                )
+            )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -476,17 +559,25 @@ def render_full_panel(
     priors_note: str = "",
     team_summary: dict | None = None,
     momentum: pd.DataFrame | None = None,
+    verdicts: dict | None = None,
+    detail: dict | None = None,
 ) -> None:
+    keeper = keeper_pressure(detail.get("players", {})) if detail else None
+    conflicts = consistency.conflict_moments(verdicts) if verdicts else []
     render_headline(state, team_summary)
     render_metrics(state, st.container())
     if team_summary:
-        render_team_moods(team_summary)
+        render_team_moods(team_summary, verdicts)
     render_chart(state, st.empty())
     render_situation(state, priors_note)
     render_match_stats(match_stats, momentum)
-    render_takeaways(state, match_stats)
+    if detail:
+        render_performers(
+            detail.get("leaders", {}), detail.get("key_events", []), keeper
+        )
+    render_takeaways(state, match_stats, keeper)
     render_emotions(state, st.container())
-    render_flags(state)
+    render_flags(state, conflicts)
     live_coverage = scored_share(chat["message"]) if "message" in chat.columns else None
     render_validation(live_coverage)
     render_reactions(chat)
@@ -585,11 +676,21 @@ def live_panel(event_id: str) -> None:
     if state.empty:
         st.info("Streams connected; not enough data to score yet.")
         return
-    match_stats = fetch_boxscore(event_id)
+    detail = fetch_match_detail(event_id)
+    match_stats = detail.get("stats", {})
     home_team = str(match.get("home_team") or "")
     away_team = str(match.get("away_team") or "")
     team_summary = team_emotion_summary(chat, home_team, away_team)
     momentum = fetch_sofascore_momentum(home_team, away_team)
+    latest_threat = float(state.iloc[-1]["delta_xg_10min"]) if not state.empty else 0.0
+    context = consistency.game_context(
+        str(match.get("score") or ""),
+        home_team,
+        away_team,
+        latest_threat,
+        keeper_pressure(detail.get("players", {})),
+    )
+    verdicts = consistency.mood_consistency(team_summary, context)
     if phase == "post-window":
         first_seen = post_seen.get(event_id, utc_now())
         remaining = max(0, int((POST_GRACE - (utc_now() - first_seen)).total_seconds() // 60))
@@ -599,7 +700,14 @@ def live_panel(event_id: str) -> None:
         )
         st.session_state[f"final_snapshot_{event_id}"] = (state, chat, match_stats)
     render_full_panel(
-        state, chat, match_stats, priors_note_for(match), team_summary, momentum
+        state,
+        chat,
+        match_stats,
+        priors_note_for(match),
+        team_summary,
+        momentum,
+        verdicts,
+        detail,
     )
     market = load_market(str(match.get("home_team", "")), str(match.get("away_team", "")))
     if market:

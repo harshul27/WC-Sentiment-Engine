@@ -32,9 +32,36 @@ KEY_STATS: tuple[str, ...] = (
     "foulsCommitted",
 )
 
+# Second tier shown in an expander: passing/defending depth from the same
+# ESPN boxscore payload (verified live: 28 stats are published per team).
+ADVANCED_STATS: tuple[str, ...] = (
+    "accuratePasses",
+    "passPct",
+    "totalTackles",
+    "interceptions",
+    "effectiveClearance",
+    "blockedShots",
+    "accurateCrosses",
+)
+
+# Per-player stat names worth carrying (from rosters[].roster[].stats).
+PLAYER_STATS: tuple[str, ...] = (
+    "totalGoals",
+    "goalAssists",
+    "totalShots",
+    "shotsOnTarget",
+    "saves",
+    "shotsFaced",
+    "goalsConceded",
+    "foulsCommitted",
+    "yellowCards",
+    "redCards",
+)
+
 
 def parse_boxscore(payload: dict) -> dict[str, dict[str, str]]:
-    """ESPN summary boxscore -> {team_name: {stat: value}} for key stats."""
+    """ESPN summary boxscore -> {team_name: {stat: value}} for key + advanced stats."""
+    wanted = set(KEY_STATS) | set(ADVANCED_STATS)
     result: dict[str, dict[str, str]] = {}
     for team in payload.get("boxscore", {}).get("teams", []) or []:
         name = str((team.get("team") or {}).get("displayName", "")).strip()
@@ -43,11 +70,84 @@ def parse_boxscore(payload: dict) -> dict[str, dict[str, str]]:
         stats = {
             str(s.get("name")): str(s.get("displayValue", ""))
             for s in team.get("statistics", []) or []
-            if s.get("name") in KEY_STATS
+            if s.get("name") in wanted
         }
         if stats:
             result[name] = stats
     return result
+
+
+def parse_player_stats(payload: dict) -> dict[str, list[dict[str, object]]]:
+    """ESPN summary rosters -> {team_name: [player rows]}.
+
+    Each row: name, position, starter, plus the PLAYER_STATS values (floats).
+    Players with no stats block (unused subs) are skipped.
+    """
+    result: dict[str, list[dict[str, object]]] = {}
+    for side in payload.get("rosters", []) or []:
+        team = str((side.get("team") or {}).get("displayName", "")).strip()
+        if not team:
+            continue
+        rows: list[dict[str, object]] = []
+        for entry in side.get("roster", []) or []:
+            stats = {
+                str(s.get("name")): float(s.get("value", 0.0) or 0.0)
+                for s in entry.get("stats", []) or []
+            }
+            if not stats:
+                continue
+            rows.append(
+                {
+                    "name": str((entry.get("athlete") or {}).get("displayName", "")),
+                    "position": str(
+                        (entry.get("position") or {}).get("abbreviation", "")
+                    ),
+                    "starter": bool(entry.get("starter", False)),
+                    **{k: stats.get(k, 0.0) for k in PLAYER_STATS},
+                }
+            )
+        if rows:
+            result[team] = rows
+    return result
+
+
+def parse_leaders(payload: dict) -> dict[str, dict[str, str]]:
+    """ESPN summary leaders -> {team_name: {category: "Player (value)"}}."""
+    result: dict[str, dict[str, str]] = {}
+    for block in payload.get("leaders", []) or []:
+        team = str((block.get("team") or {}).get("displayName", "")).strip()
+        if not team:
+            continue
+        categories: dict[str, str] = {}
+        for cat in block.get("leaders", []) or []:
+            top = (cat.get("leaders") or [{}])[0]
+            player = str((top.get("athlete") or {}).get("displayName", ""))
+            value = str(top.get("displayValue", ""))
+            if player:
+                categories[str(cat.get("name", ""))] = f"{player} ({value})"
+        if categories:
+            result[team] = categories
+    return result
+
+
+def parse_key_events(payload: dict) -> list[dict[str, object]]:
+    """ESPN summary keyEvents -> [{minute, type, team, text}] (typed events only)."""
+    events: list[dict[str, object]] = []
+    for event in payload.get("keyEvents", []) or []:
+        kind = str((event.get("type") or {}).get("type", ""))
+        if not kind:
+            continue
+        clock = event.get("clock") or {}
+        seconds = float(clock.get("value", 0.0) or 0.0)  # ESPN clock is seconds
+        events.append(
+            {
+                "minute": int(seconds // 60),
+                "type": kind,
+                "team": str((event.get("team") or {}).get("displayName", "")),
+                "text": str(event.get("text", "")),
+            }
+        )
+    return events
 
 
 def fetch_boxscore(event_id: str, timeout: float = 15.0) -> dict[str, dict[str, str]]:
@@ -63,6 +163,93 @@ def fetch_boxscore(event_id: str, timeout: float = 15.0) -> dict[str, dict[str, 
         return parse_boxscore(response.json())
     except (requests.RequestException, ValueError):
         return {}
+
+
+def fetch_match_detail(event_id: str, timeout: float = 15.0) -> dict[str, object]:
+    """Everything the live panel needs from ONE summary request.
+
+    Returns {stats, players, leaders, key_events}; every part degrades to
+    empty on failure so the panel can render whatever arrived.
+    """
+    empty: dict[str, object] = {
+        "stats": {},
+        "players": {},
+        "leaders": {},
+        "key_events": [],
+    }
+    try:
+        response = requests.get(
+            f"{ESPN_BASE}/summary",
+            params={"event": event_id},
+            timeout=timeout,
+            headers=USER_AGENT,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError):
+        return empty
+    return {
+        "stats": parse_boxscore(payload),
+        "players": parse_player_stats(payload),
+        "leaders": parse_leaders(payload),
+        "key_events": parse_key_events(payload),
+    }
+
+
+def keeper_pressure(
+    players: dict[str, list[dict[str, object]]],
+) -> dict[str, dict[str, float]]:
+    """Per-team goalkeeper workload: {team: {keeper, saves, shots_faced, conceded}}.
+
+    "Fans furious while the keeper is making save after save" is a classic
+    mood-vs-game conflict; this makes that context available to the takeaway
+    and consistency layers.
+    """
+    result: dict[str, dict[str, float]] = {}
+    for team, rows in (players or {}).items():
+        keepers = [r for r in rows if str(r.get("position")) == "G"]
+        if not keepers:
+            continue
+        keeper = max(keepers, key=lambda r: float(r.get("saves", 0.0) or 0.0))
+        result[team] = {
+            "keeper": str(keeper.get("name", "")),
+            "saves": float(keeper.get("saves", 0.0) or 0.0),
+            "shots_faced": float(keeper.get("shotsFaced", 0.0) or 0.0),
+            "conceded": float(keeper.get("goalsConceded", 0.0) or 0.0),
+        }
+    return result
+
+
+def top_performers(leaders: dict[str, dict[str, str]]) -> dict[str, str]:
+    """One readable line per team from the ESPN leader categories."""
+    labels = {
+        "totalShots": "shots",
+        "accuratePasses": "passes",
+        "defensiveInterventions": "defensive actions",
+        "saves": "saves",
+    }
+    lines: dict[str, str] = {}
+    for team, categories in (leaders or {}).items():
+        parts = [
+            f"{categories[key]} {label}"
+            for key, label in labels.items()
+            if key in categories
+        ]
+        if parts:
+            lines[team] = "; ".join(parts)
+    return lines
+
+
+def goal_scorers(key_events: list[dict[str, object]]) -> list[str]:
+    """Readable goal lines ("23' Mexico — <text>") from parsed key events."""
+    lines: list[str] = []
+    for event in key_events or []:
+        if str(event.get("type", "")) not in ("goal", "penalty--scored", "own-goal"):
+            continue
+        team = str(event.get("team", ""))
+        text = str(event.get("text", "")) or str(event.get("type", ""))
+        lines.append(f"{int(event.get('minute', 0))}' {team} — {text}".strip())
+    return lines
 
 
 def _stat_share(stats: dict[str, dict[str, str]], key: str) -> float | None:
