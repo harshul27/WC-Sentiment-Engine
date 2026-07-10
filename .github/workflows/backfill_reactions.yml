@@ -1,0 +1,45 @@
+name: Backfill Reactions
+
+# One-off/manual: re-fetch historical fan reactions for archived fixtures
+# (Bluesky time-windowed search + Reddit match threads) into Supabase.
+on:
+  workflow_dispatch:
+    inputs:
+      match_id:
+        description: "Single match_id (e.g. ESPN-760415); empty = all fixtures"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backfill-reactions
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install pinned dependencies
+        run: pip install -r requirements.txt
+
+      - name: Backfill historical reactions into Supabase
+        run: python scripts/backfill_reactions.py ${{ inputs.match_id }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}

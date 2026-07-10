@@ -120,6 +120,61 @@ def fetch_bluesky(terms: list[str], limit: int = 100, timeout: float = 15.0) -> 
     return _frame(rows)
 
 
+def fetch_bluesky_window(
+    terms: list[str],
+    since: str,
+    until: str,
+    max_pages: int = 4,
+    timeout: float = 15.0,
+) -> pd.DataFrame:
+    """Historical Bluesky posts for a time window (ISO8601 since/until).
+
+    Used by the reactions backfill: Bluesky's searchPosts supports since/until
+    with cursor pagination, so past match windows remain queryable. Pages are
+    capped per term to stay polite.
+    """
+    rows: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for term in terms:
+        cursor = ""
+        for _ in range(max_pages):
+            params = {
+                "q": term,
+                "limit": 100,
+                "sort": "latest",
+                "since": since,
+                "until": until,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                response = requests.get(
+                    BLUESKY_SEARCH, params=params, timeout=timeout, headers=USER_AGENT
+                )
+                response.raise_for_status()
+                payload = response.json()
+            except (requests.RequestException, ValueError):
+                break
+            for post in payload.get("posts", []) or []:
+                uri = str(post.get("uri", ""))
+                if uri in seen:
+                    continue
+                seen.add(uri)
+                record = post.get("record") or {}
+                rows.append(
+                    {
+                        "created_utc": record.get("createdAt"),
+                        "message": record.get("text", ""),
+                        "source": "bluesky",
+                        "author": str((post.get("author") or {}).get("handle", "")),
+                    }
+                )
+            cursor = str(payload.get("cursor", ""))
+            if not cursor:
+                break
+    return _frame(rows)
+
+
 def fetch_mastodon(tags: list[str], limit: int = 40, timeout: float = 15.0) -> pd.DataFrame:
     """Public hashtag timeline posts from a Mastodon instance (no key)."""
     rows: list[dict[str, object]] = []
@@ -174,11 +229,17 @@ def _reddit_token(timeout: float = 15.0) -> str:
         return ""
 
 
-def fetch_reddit(team_terms: list[str], limit: int = 100, timeout: float = 15.0) -> pd.DataFrame:
+def fetch_reddit(
+    team_terms: list[str],
+    limit: int = 100,
+    timeout: float = 15.0,
+    time_filter: str = "day",
+) -> pd.DataFrame:
     """Newest comments from the most recent r/soccer match thread.
 
     Requires REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET (free script app from
-    reddit.com/prefs/apps); silently skipped otherwise.
+    reddit.com/prefs/apps); silently skipped otherwise. time_filter widens the
+    thread search window ("day" live; "year" for the historical backfill).
     """
     token = _reddit_token(timeout)
     if not token:
@@ -188,7 +249,13 @@ def fetch_reddit(team_terms: list[str], limit: int = 100, timeout: float = 15.0)
     try:
         search = requests.get(
             "https://oauth.reddit.com/r/soccer+worldcup/search",
-            params={"q": query, "sort": "new", "restrict_sr": 1, "t": "day", "limit": 3},
+            params={
+                "q": query,
+                "sort": "new",
+                "restrict_sr": 1,
+                "t": time_filter,
+                "limit": 3,
+            },
             timeout=timeout,
             headers=auth_headers,
         )
