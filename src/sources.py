@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 
 import pandas as pd
 import requests
@@ -126,12 +127,15 @@ def fetch_bluesky_window(
     until: str,
     max_pages: int = 4,
     timeout: float = 15.0,
+    page_delay: float = 0.6,
 ) -> pd.DataFrame:
     """Historical Bluesky posts for a time window (ISO8601 since/until).
 
     Used by the reactions backfill: Bluesky's searchPosts supports since/until
-    with cursor pagination, so past match windows remain queryable. Pages are
-    capped per term to stay polite.
+    with cursor pagination. Backfilling many fixtures fires hundreds of
+    requests, so pages are throttled (page_delay) and a 429 is honoured with
+    the server's Retry-After before one retry - a silent break here zeroed out
+    79 of 82 fixtures on the first backfill run.
     """
     rows: list[dict[str, object]] = []
     seen: set[str] = set()
@@ -147,13 +151,28 @@ def fetch_bluesky_window(
             }
             if cursor:
                 params["cursor"] = cursor
-            try:
-                response = requests.get(
-                    BLUESKY_SEARCH, params=params, timeout=timeout, headers=USER_AGENT
-                )
-                response.raise_for_status()
-                payload = response.json()
-            except (requests.RequestException, ValueError):
+            payload = None
+            for attempt in (1, 2):
+                try:
+                    response = requests.get(
+                        BLUESKY_SEARCH,
+                        params=params,
+                        timeout=timeout,
+                        headers=USER_AGENT,
+                    )
+                    if response.status_code == 429 and attempt == 1:
+                        wait = min(
+                            60.0, float(response.headers.get("Retry-After", 15))
+                        )
+                        print(f"[sources] bluesky 429 for '{term}'; waiting {wait:.0f}s")
+                        time.sleep(wait)
+                        continue
+                    response.raise_for_status()
+                    payload = response.json()
+                except (requests.RequestException, ValueError) as exc:
+                    print(f"[sources] bluesky window fetch failed for '{term}': {exc}")
+                break
+            if payload is None:
                 break
             for post in payload.get("posts", []) or []:
                 uri = str(post.get("uri", ""))
@@ -172,6 +191,7 @@ def fetch_bluesky_window(
             cursor = str(payload.get("cursor", ""))
             if not cursor:
                 break
+            time.sleep(page_delay)
     return _frame(rows)
 
 

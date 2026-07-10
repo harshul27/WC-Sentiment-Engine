@@ -19,6 +19,7 @@ Usage (needs SUPABASE_URL/SUPABASE_KEY in env; runs from repo root):
 from __future__ import annotations
 
 import sys
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -82,8 +83,10 @@ def main() -> None:
         total += pushed
         print(
             f"[backfill] {row['match_id']} {row['home_team']} vs "
-            f"{row['away_team']}: {pushed} reactions"
+            f"{row['away_team']}: {pushed} reactions",
+            flush=True,
         )
+        time.sleep(2)  # politeness gap between fixtures (rate-limit headroom)
     print(f"[backfill] done - {total} reactions across {len(results)} fixtures")
 
 

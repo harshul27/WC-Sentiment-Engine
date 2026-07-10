@@ -9,6 +9,9 @@ import sources
 
 
 class FakeResponse:
+    status_code = 200
+    headers: dict = {}
+
     def __init__(self, payload: object) -> None:
         self._payload = payload
 
