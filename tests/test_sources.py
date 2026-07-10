@@ -165,6 +165,41 @@ def test_gather_reactions_all_sources_empty(monkeypatch: pytest.MonkeyPatch) -> 
     assert sources.gather_reactions(["Mexico"]).empty
 
 
+def test_fetch_bluesky_window_paginates_with_since_until(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict] = []
+
+    def fake_get(url: str, **kwargs: object) -> FakeResponse:
+        params = kwargs.get("params", {})
+        calls.append(dict(params))
+        page = 2 if "cursor" in params else 1
+        payload = {
+            "posts": [
+                {
+                    "uri": f"at://p{page}",
+                    "record": {
+                        "createdAt": "2026-06-11T19:30:00Z",
+                        "text": f"Mexico reaction page {page}",
+                    },
+                    "author": {"handle": "fan"},
+                }
+            ]
+        }
+        if page == 1:
+            payload["cursor"] = "next"
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(sources.requests, "get", fake_get)
+    frame = sources.fetch_bluesky_window(
+        ["Mexico"], "2026-06-11T18:45:00Z", "2026-06-11T21:10:00Z"
+    )
+    assert len(frame) == 2  # both pages collected, deduped by uri
+    assert calls[0]["since"] == "2026-06-11T18:45:00Z"
+    assert calls[0]["until"] == "2026-06-11T21:10:00Z"
+    assert calls[1]["cursor"] == "next"
+
+
 def test_clean_reactions_filters_jargon_and_bots() -> None:
     frame = pd.DataFrame(
         {
