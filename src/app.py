@@ -25,6 +25,7 @@ import consistency
 import glossary
 import health
 import odds
+import publish
 from advanced import fixture_prior
 from archive import load_archive
 from emotion import (
@@ -66,6 +67,7 @@ CHART_LABELS = {col: glossary.label(col) for col in CHART_COLUMNS}
 MODE_LIVE = "🔴 Live match"
 MODE_SIM = "🎮 Simulator"
 MODE_STATE = "📦 Committed state"
+MODE_PUBLISH = "📤 Publish Insights"
 EMOTION_LABELS = {col: col.removeprefix("emo_").title() for col in EMOTION_COLUMNS}
 TONE_RENDERERS = {"warning": st.warning, "positive": st.success, "info": st.info}
 # Friendly stat labels for the per-team live match-stats panel.
@@ -778,6 +780,44 @@ def render_state_mode() -> None:
     render_validation()
 
 
+def render_publish_mode() -> None:
+    """Draft honest, labelled insight posts for Bluesky and read their reach."""
+    st.subheader("📤 Publish Insights to Bluesky")
+    st.caption(
+        "Shares the engine's genuine, clearly-labelled analytics from your own "
+        "account (only when you click), and reads organic engagement on those "
+        "posts. Not an influence tool — no autonomous posting, no crowd targeting."
+    )
+    state = load_state()
+    headline = headline_outcome(state, active_threshold()) if not state.empty else ""
+    draft = publish.draft_post(state, headline)
+    text = st.text_area("Post preview (editable)", value=draft, height=160)
+    st.caption(f"{len(text)}/290 characters")
+    if publish.enabled():
+        if st.button("Post to Bluesky", type="primary"):
+            uri = publish.post_insight(text)
+            if uri:
+                st.success("Posted. It may take a moment to appear below.")
+            else:
+                st.error("Post failed — check the app-password secret and try again.")
+    else:
+        st.info(
+            "Preview only. Set BLUESKY_HANDLE + BLUESKY_APP_PASSWORD (an app "
+            "password from Bluesky → Settings → App Passwords) to enable posting."
+        )
+    st.divider()
+    st.subheader("📈 Engagement on your recent posts")
+    feed = publish.recent_engagement()
+    if feed.empty:
+        st.caption("No posts found yet (set BLUESKY_HANDLE to read your feed).")
+    else:
+        st.dataframe(feed, use_container_width=True, hide_index=True)
+        st.caption(
+            "Descriptive reach only — likes/reposts/replies on your posts. Crowd "
+            "mood during a live match is driven by the game, not by these posts."
+        )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="World Cup Crowd Mood Engine", page_icon="⚽", layout="wide"
@@ -796,7 +836,10 @@ def main() -> None:
     with st.sidebar:
         st.header("Mode")
         mode = st.radio(
-            "Data source", [MODE_LIVE, MODE_SIM, MODE_STATE], key="mode", index=0
+            "Data source",
+            [MODE_LIVE, MODE_SIM, MODE_STATE, MODE_PUBLISH],
+            key="mode",
+            index=0,
         )
         st.divider()
         st.header("Simulator Controls")
@@ -814,6 +857,8 @@ def main() -> None:
         render_live_mode()
     elif mode == MODE_SIM:
         render_simulator_mode(seed, speed)
+    elif mode == MODE_PUBLISH:
+        render_publish_mode()
     else:
         render_state_mode()
 
