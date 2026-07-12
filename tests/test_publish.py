@@ -43,6 +43,60 @@ def test_draft_empty_state() -> None:
     assert publish.LABEL in draft
 
 
+def _match_row(score: str = "0-2") -> pd.Series:
+    return pd.Series(
+        {
+            "home_team": "Mexico",
+            "away_team": "England",
+            "score": score,
+            "short_name": "ENG @ MEX",
+        }
+    )
+
+
+def test_underdog_case_backs_trailing_side_with_evidence() -> None:
+    stats = {"Mexico": {"shotsOnTarget": "5"}, "England": {"shotsOnTarget": "3"}}
+    keeper = {"England": {"keeper": "Pickford", "saves": 5.0, "shots_faced": 6.0}}
+    text = publish.underdog_case(_match_row("0-2"), _state(), stats, keeper)
+    assert text is not None
+    assert "Mexico aren't done yet" in text
+    assert "5 shots on target" in text
+    assert "Pickford" not in text  # keeper cited by team line, not name
+    assert "5 saves" in text
+    assert "#MEXENG #FIFAWorldCup" in text
+    assert publish.LABEL in text
+    assert len(text) <= publish.MAX_CHARS
+
+
+def test_underdog_case_refuses_without_evidence() -> None:
+    """No supporting data -> no post. Belief is never fabricated."""
+    state = _state().assign(delta_xg_10min=[0.05])
+    stats = {"Mexico": {"shotsOnTarget": "0"}, "England": {"shotsOnTarget": "8"}}
+    assert publish.underdog_case(_match_row("0-3"), state, stats, {}) is None
+
+
+def test_underdog_case_level_game_needs_market() -> None:
+    stats = {"Mexico": {"shotsOnTarget": "4"}}
+    assert publish.underdog_case(_match_row("1-1"), _state(), stats, {}) is None
+    market = {"home_prob": 0.2, "away_prob": 0.5}
+    text = publish.underdog_case(_match_row("1-1"), _state(), stats, {}, market)
+    assert text is not None and "Mexico" in text
+
+
+def test_match_hashtags() -> None:
+    assert publish.match_hashtags("MAR @ FRA") == "#FRAMAR #FIFAWorldCup"
+    assert publish.match_hashtags("") == "#FIFAWorldCup"
+
+
+def test_should_autopost_rate_limits() -> None:
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 7, 11, 20, 30, tzinfo=timezone.utc)
+    assert publish.should_autopost("", now=now) is True
+    assert publish.should_autopost("2026-07-11T20:20:00+00:00", now=now) is False
+    assert publish.should_autopost("2026-07-11T20:10:00+00:00", now=now) is True
+
+
 def test_post_disabled_without_credentials() -> None:
     assert publish.enabled() is False
     assert publish.post_insight("hello") is None  # no creds -> no network
