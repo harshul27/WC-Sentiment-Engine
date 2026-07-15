@@ -24,6 +24,8 @@ def no_external_keys(monkeypatch: pytest.MonkeyPatch) -> None:
         "ODDS_SPORT_KEY",
         "SUPABASE_URL",
         "SUPABASE_KEY",
+        "BLUESKY_HANDLE",
+        "BLUESKY_APP_PASSWORD",
         "ENABLE_SOFASCORE",
     ):
         monkeypatch.delenv(key, raising=False)

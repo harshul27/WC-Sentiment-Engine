@@ -25,6 +25,7 @@ import consistency
 import glossary
 import health
 import odds
+import publish
 from advanced import fixture_prior
 from archive import load_archive
 from emotion import (
@@ -66,6 +67,7 @@ CHART_LABELS = {col: glossary.label(col) for col in CHART_COLUMNS}
 MODE_LIVE = "🔴 Live match"
 MODE_SIM = "🎮 Simulator"
 MODE_STATE = "📦 Committed state"
+MODE_PUBLISH = "📤 Publish Insights"
 EMOTION_LABELS = {col: col.removeprefix("emo_").title() for col in EMOTION_COLUMNS}
 TONE_RENDERERS = {"warning": st.warning, "positive": st.success, "info": st.info}
 # Friendly stat labels for the per-team live match-stats panel.
@@ -683,14 +685,34 @@ def live_panel(event_id: str) -> None:
     team_summary = team_emotion_summary(chat, home_team, away_team)
     momentum = fetch_sofascore_momentum(home_team, away_team)
     latest_threat = float(state.iloc[-1]["delta_xg_10min"]) if not state.empty else 0.0
+    keeper = keeper_pressure(detail.get("players", {}))
     context = consistency.game_context(
         str(match.get("score") or ""),
         home_team,
         away_team,
         latest_threat,
-        keeper_pressure(detail.get("players", {})),
+        keeper,
     )
     verdicts = consistency.mood_consistency(team_summary, context)
+    market = load_market(home_team, away_team)
+    # Overreaction trigger: draft (and optionally auto-post, opt-in + rate
+    # limited) the data-backed underdog case. Labelled automation from the
+    # user's own account; standard fixture hashtags only.
+    overreacting = bool(state.iloc[-1]["flagged"]) or bool(
+        consistency.conflict_moments(verdicts)
+    )
+    if overreacting:
+        draft = publish.underdog_case(match, state, match_stats, keeper, market)
+        if draft:
+            st.session_state["underdog_draft"] = draft
+            if (
+                st.session_state.get("autopost_underdog")
+                and publish.enabled()
+                and publish.should_autopost(st.session_state.get("last_autopost", ""))
+            ):
+                if publish.post_insight(draft):
+                    st.session_state["last_autopost"] = utc_now().isoformat()
+                    st.toast("📤 Posted the underdog case to Bluesky")
     if phase == "post-window":
         first_seen = post_seen.get(event_id, utc_now())
         remaining = max(0, int((POST_GRACE - (utc_now() - first_seen)).total_seconds() // 60))
@@ -709,7 +731,6 @@ def live_panel(event_id: str) -> None:
         verdicts,
         detail,
     )
-    market = load_market(str(match.get("home_team", "")), str(match.get("away_team", "")))
     if market:
         render_market(market, float(state.iloc[-1]["crowd_panic_score"]))
     st.caption(f"Live mode - last refresh {utc_now():%H:%M:%S UTC}, next in ~60s.")
@@ -778,6 +799,55 @@ def render_state_mode() -> None:
     render_validation()
 
 
+def render_publish_mode() -> None:
+    """Draft honest, labelled insight posts for Bluesky and read their reach."""
+    st.subheader("📤 Publish Insights to Bluesky")
+    st.caption(
+        "Shares the engine's genuine, clearly-labelled analytics from your own "
+        "account, and reads organic engagement on those posts. Not an influence "
+        "tool — no thread targeting, and reach is never framed as moving the crowd."
+    )
+    queued = st.session_state.get("underdog_draft", "")
+    if queued:
+        st.subheader("🔥 Underdog case (from the latest overreaction moment)")
+        queued_text = st.text_area("Queued draft (editable)", value=queued, height=160)
+        if publish.enabled() and st.button("Post underdog case", type="primary"):
+            if publish.post_insight(queued_text):
+                st.session_state["last_autopost"] = utc_now().isoformat()
+                st.success("Posted.")
+            else:
+                st.error("Post failed — check the app-password secret.")
+        st.divider()
+    state = load_state()
+    headline = headline_outcome(state, active_threshold()) if not state.empty else ""
+    draft = publish.draft_post(state, headline)
+    text = st.text_area("Post preview (editable)", value=draft, height=160)
+    st.caption(f"{len(text)}/290 characters")
+    if publish.enabled():
+        if st.button("Post to Bluesky", type="primary"):
+            uri = publish.post_insight(text)
+            if uri:
+                st.success("Posted. It may take a moment to appear below.")
+            else:
+                st.error("Post failed — check the app-password secret and try again.")
+    else:
+        st.info(
+            "Preview only. Set BLUESKY_HANDLE + BLUESKY_APP_PASSWORD (an app "
+            "password from Bluesky → Settings → App Passwords) to enable posting."
+        )
+    st.divider()
+    st.subheader("📈 Engagement on your recent posts")
+    feed = publish.recent_engagement()
+    if feed.empty:
+        st.caption("No posts found yet (set BLUESKY_HANDLE to read your feed).")
+    else:
+        st.dataframe(feed, use_container_width=True, hide_index=True)
+        st.caption(
+            "Descriptive reach only — likes/reposts/replies on your posts. Crowd "
+            "mood during a live match is driven by the game, not by these posts."
+        )
+
+
 def main() -> None:
     st.set_page_config(
         page_title="World Cup Crowd Mood Engine", page_icon="⚽", layout="wide"
@@ -796,12 +866,25 @@ def main() -> None:
     with st.sidebar:
         st.header("Mode")
         mode = st.radio(
-            "Data source", [MODE_LIVE, MODE_SIM, MODE_STATE], key="mode", index=0
+            "Data source",
+            [MODE_LIVE, MODE_SIM, MODE_STATE, MODE_PUBLISH],
+            key="mode",
+            index=0,
         )
         st.divider()
         st.header("Simulator Controls")
         seed = int(st.number_input("Match seed", min_value=1, value=20260610, step=1))
         speed = float(st.slider("Tick speed (seconds)", 0.01, 0.50, 0.05, 0.01))
+        if publish.enabled():
+            st.divider()
+            st.header("Publishing")
+            st.toggle(
+                "Auto-post underdog case on overreaction (max 1 / 15 min)",
+                key="autopost_underdog",
+                help="When an overreaction moment fires in live mode, post the "
+                "data-backed underdog case from your Bluesky account. Clearly "
+                "labelled as automation; off by default.",
+            )
         config = load_config(str(CONFIG_PATH))
         st.divider()
         st.subheader("Active Model Config")
@@ -814,6 +897,8 @@ def main() -> None:
         render_live_mode()
     elif mode == MODE_SIM:
         render_simulator_mode(seed, speed)
+    elif mode == MODE_PUBLISH:
+        render_publish_mode()
     else:
         render_state_mode()
 
