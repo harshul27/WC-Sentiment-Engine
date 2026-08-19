@@ -4,4 +4,4 @@
 # pure-numpy artifacts in data/models/ and scored by src/textmodel.py. Install
 # this only to reproduce training: pip install -r requirements-train.txt
 -r requirements.txt
-scikit-learn==1.7.0
+scikit-learn==1.9.0
